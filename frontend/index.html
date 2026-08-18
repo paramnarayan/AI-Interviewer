@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description"
+    content="AI-powered voice interview coach — practice technical interviews with real-time voice interaction">
+  <title>AI Interview Coach — Voice Agent</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+
+  <div class="app-container" id="appContainer">
+
+    <!-- Header -->
+    <header class="app-header">
+      <h1><span class="brand-accent">Interview Coach</span></h1>
+    </header>
+
+    <!-- Orb Section -->
+    <div class="orb-wrapper" id="orbWrapper" role="button" aria-label="Start or stop voice interview" tabindex="0">
+      <!-- Ripple rings (visible during AI speaking) -->
+      <div class="ripple-ring"></div>
+      <div class="ripple-ring"></div>
+      <div class="ripple-ring"></div>
+
+      <!-- Audio bars container (visible during user listening) -->
+      <div class="audio-bars" id="audioBars"></div>
+
+      <!-- Processing spinner -->
+      <div class="processing-spinner"></div>
+
+      <!-- Main orb -->
+      <div class="orb">
+        <div class="orb-icon">
+          <!-- Microphone SVG icon -->
+          <svg viewBox="0 0 24 24" id="orbSvgIcon">
+            <path d="M12 1a4 4 0 0 0-4 4v7a4 4 0 0 0 8 0V5a4 4 0 0 0-4-4z" />
+            <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+            <line x1="12" y1="19" x2="12" y2="23" />
+            <line x1="8" y1="23" x2="16" y2="23" />
+          </svg>
+        </div>
+      </div>
+    </div>
+
+    <!-- Status -->
+    <div class="status-area">
+      <div class="status-text" id="statusText">Tap to begin</div>
+      <div class="status-hint" id="statusHint">Start your mock interview session</div>
+    </div>
+
+    <!-- Transcript -->
+    <div class="transcript-panel" id="transcriptPanel">
+      <div class="transcript-empty" id="transcriptEmpty">
+        Your conversation will appear here
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Connection indicator -->
+  <div class="connection-status">
+    <span class="connection-dot" id="connectionDot"></span>
+    <span id="connectionLabel">Disconnected</span>
+  </div>
+
+  <script src="main.js"></script>
+</body>
+
+</html>
