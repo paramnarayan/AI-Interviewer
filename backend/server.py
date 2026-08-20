@@ -36,7 +36,7 @@ async def websocket_endpoint(websocket: WebSocket):
     detector = TurnDetector(sample_rate=SAMPLE_RATE_IN, silence_ms=VAD_SILENCE_MS)
 
     try:
-        # ── Step 1: receive the setup profile (always the first message) ──
+        
         setup_msg = await websocket.receive_json()
         session.set_profile(setup_msg)
         log.info(
@@ -57,6 +57,11 @@ async def websocket_endpoint(websocket: WebSocket):
         
         while True:
             msg = await websocket.receive()
+
+            # Client disconnected cleanly — exit loop
+            if msg["type"] == "websocket.disconnect":
+                log.info("Client disconnected")
+                break
 
             
             if msg["type"] == "websocket.receive" and msg.get("text"):

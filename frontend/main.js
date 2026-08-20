@@ -18,6 +18,11 @@ const connectionLabel = document.getElementById('connectionLabel');
 const setupForm = document.getElementById('setupForm');
 const formPanel = document.getElementById('formPanel');
 const beginBtn = document.getElementById('beginBtn');
+const endInterviewBtn = document.getElementById('endInterviewBtn');
+const summaryModal = document.getElementById('summaryModal');
+const summaryLoading = document.getElementById('summaryLoading');
+const summaryContent = document.getElementById('summaryContent');
+const summaryError = document.getElementById('summaryError');
 
 // ─── App State ───
 let appState = 'idle'; // idle | listening | processing | speaking
@@ -46,11 +51,13 @@ function setState(newState) {
     window.setWaveActive(newState === 'speaking' || newState === 'listening');
   }
 
-  // Show/hide status area
+  // Show/hide status area and end button
   if (newState === 'idle') {
     statusArea.style.display = 'none';
+    endInterviewBtn.style.display = 'none';
   } else {
     statusArea.style.display = 'flex';
+    endInterviewBtn.style.display = 'block';
   }
 
   // Update status text
@@ -129,6 +136,10 @@ function handleJsonMessage(msg) {
     setTimeout(() => {
       if (appState === 'speaking') setState('listening');
     }, delayMs);
+  } else if (msg.type === 'summary') {
+    populateSummary(msg.data);
+  } else if (msg.type === 'summary_error') {
+    showSummaryError();
   }
 }
 
@@ -270,6 +281,100 @@ orbWrapper.addEventListener('keydown', (e) => {
     e.preventDefault();
     stopSession();
   }
+});
+
+// ─── End Interview ───
+endInterviewBtn.addEventListener('click', () => {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+  // Show modal in loading state immediately
+  summaryModal.style.display = 'flex';
+  summaryLoading.style.display = 'flex';
+  summaryContent.style.display = 'none';
+  summaryError.style.display = 'none';
+
+  // Stop mic so no more audio is sent
+  if (micStream) micStream.getTracks().forEach(t => t.stop());
+
+  // Send control message — server will generate summary and close connection
+  ws.send(JSON.stringify({ type: 'end_interview' }));
+
+  // Hide the end button to prevent double-clicks
+  endInterviewBtn.style.display = 'none';
+
+  // Safety timeout — if summary doesn't arrive in 35s, show error
+  const summaryTimeout = setTimeout(() => {
+    if (summaryLoading.style.display !== 'none') {
+      showSummaryError();
+    }
+  }, 35000);
+
+  // Clear the timeout once modal switches away from loading
+  const clearOnLoad = new MutationObserver(() => {
+    if (summaryLoading.style.display === 'none') {
+      clearTimeout(summaryTimeout);
+      clearOnLoad.disconnect();
+    }
+  });
+  clearOnLoad.observe(summaryLoading, { attributes: true, attributeFilter: ['style'] });
+});
+
+// ─── Summary Modal ───
+function populateSummary(data) {
+  // Overall impression
+  document.getElementById('summaryOverall').textContent = data.overall_impression || '—';
+
+  // Strengths
+  const strengthsList = document.getElementById('summaryStrengths');
+  strengthsList.innerHTML = '';
+  (data.strengths || []).forEach(s => {
+    const li = document.createElement('li');
+    li.textContent = s;
+    strengthsList.appendChild(li);
+  });
+
+  // Areas to improve
+  const areasList = document.getElementById('summaryAreas');
+  areasList.innerHTML = '';
+  (data.areas_to_improve || []).forEach(a => {
+    const li = document.createElement('li');
+    li.textContent = a;
+    areasList.appendChild(li);
+  });
+
+  // Communication notes
+  document.getElementById('summaryComms').textContent = data.communication_notes || '—';
+
+  // Next steps
+  const stepsList = document.getElementById('summaryNextSteps');
+  stepsList.innerHTML = '';
+  (data.suggested_next_steps || []).forEach(s => {
+    const li = document.createElement('li');
+    li.textContent = s;
+    stepsList.appendChild(li);
+  });
+
+  // Switch to content view
+  summaryLoading.style.display = 'none';
+  summaryContent.style.display = 'block';
+
+  // Clean up session now that summary is shown
+  stopSession();
+}
+
+function showSummaryError() {
+  summaryLoading.style.display = 'none';
+  summaryError.style.display = 'block';
+  stopSession();
+}
+
+document.getElementById('closeSummaryBtn').addEventListener('click', () => {
+  summaryModal.style.display = 'none';
+});
+
+// Close on backdrop click
+summaryModal.addEventListener('click', (e) => {
+  if (e.target === summaryModal) summaryModal.style.display = 'none';
 });
 
 // ─── Initialize ───

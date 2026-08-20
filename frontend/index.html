@@ -81,11 +81,58 @@
           </div>
         </div>
 
+        <!-- End Interview button — shown during active session -->
+        <button id="endInterviewBtn" class="end-interview-btn" style="display:none;">
+          End Interview &amp; Get Summary
+        </button>
+
       </div><!-- /.session-column -->
     </div><!-- /.main-layout -->
 
   </div><!-- /#appContainer -->
 
+
+  <!-- Summary Modal -->
+  <div id="summaryModal" class="summary-modal" style="display:none;">
+    <div class="summary-card">
+      <div class="summary-card-header">
+        <h2 class="summary-title">Interview Summary</h2>
+        <button id="closeSummaryBtn" class="summary-close" aria-label="Close">&times;</button>
+      </div>
+
+      <div id="summaryLoading" class="summary-loading">
+        <div class="summary-spinner"></div>
+        <p>Analyzing your interview…</p>
+      </div>
+
+      <div id="summaryContent" class="summary-content" style="display:none;">
+        <section class="summary-section">
+          <h3 class="summary-section-title">Overall Impression</h3>
+          <p id="summaryOverall" class="summary-text"></p>
+        </section>
+        <section class="summary-section">
+          <h3 class="summary-section-title">Strengths</h3>
+          <ul id="summaryStrengths" class="summary-list summary-list--positive"></ul>
+        </section>
+        <section class="summary-section">
+          <h3 class="summary-section-title">Areas to Improve</h3>
+          <ul id="summaryAreas" class="summary-list summary-list--improve"></ul>
+        </section>
+        <section class="summary-section">
+          <h3 class="summary-section-title">Communication Notes</h3>
+          <p id="summaryComms" class="summary-text"></p>
+        </section>
+        <section class="summary-section">
+          <h3 class="summary-section-title">Next Steps</h3>
+          <ul id="summaryNextSteps" class="summary-list summary-list--steps"></ul>
+        </section>
+      </div>
+
+      <div id="summaryError" class="summary-error" style="display:none;">
+        <p>Could not generate summary. Please try again.</p>
+      </div>
+    </div>
+  </div>
 
   <!-- Connection indicator -->
   <div class="connection-status">
