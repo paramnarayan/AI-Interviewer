@@ -19,53 +19,365 @@
       <h1><span class="brand-accent">Interview Coach</span></h1>
     </header>
 
-    <!-- Orb Section -->
-    <div class="orb-wrapper" id="orbWrapper" role="button" aria-label="Start or stop voice interview" tabindex="0">
-      <!-- Ripple rings (visible during AI speaking) -->
-      <div class="ripple-ring"></div>
-      <div class="ripple-ring"></div>
-      <div class="ripple-ring"></div>
+    <!-- Two-column layout: form left, orb right -->
+    <div class="main-layout">
 
-      <!-- Audio bars container (visible during user listening) -->
-      <div class="audio-bars" id="audioBars"></div>
-
-      <!-- Processing spinner -->
-      <div class="processing-spinner"></div>
-
-      <!-- Main orb -->
-      <div class="orb">
-        <div class="orb-icon">
-          <!-- Microphone SVG icon -->
-          <svg viewBox="0 0 24 24" id="orbSvgIcon">
-            <path d="M12 1a4 4 0 0 0-4 4v7a4 4 0 0 0 8 0V5a4 4 0 0 0-4-4z" />
-            <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-            <line x1="12" y1="19" x2="12" y2="23" />
-            <line x1="8" y1="23" x2="16" y2="23" />
-          </svg>
+      <!-- ── Left Panel: Setup Form ── -->
+      <aside class="form-panel" id="formPanel">
+        <div class="form-panel-header">
+          <p class="form-panel-title">Interview Setup</p>
+          <p class="form-panel-sub">Tell us about your session before we begin.</p>
         </div>
-      </div>
-    </div>
 
-    <!-- Status -->
-    <div class="status-area">
-      <div class="status-text" id="statusText">Tap to begin</div>
-      <div class="status-hint" id="statusHint">Start your mock interview session</div>
-    </div>
+        <form id="setupForm" class="setup-form" autocomplete="off" novalidate>
+          <div class="setup-field">
+            <label class="setup-label" for="candidateName">Your Name</label>
+            <input id="candidateName" class="setup-input" type="text" placeholder="e.g. Alex Kim" />
+          </div>
+          <div class="setup-field">
+            <label class="setup-label" for="targetRole">Target Role</label>
+            <input id="targetRole" class="setup-input" type="text" placeholder="e.g. Backend Engineer" />
+          </div>
+          <div class="setup-field">
+            <label class="setup-label" for="company">
+              Company <span class="setup-optional">optional</span>
+            </label>
+            <input id="company" class="setup-input" type="text" placeholder="e.g. Google" />
+          </div>
+          <div class="setup-field">
+            <label class="setup-label" for="techStack">Tech Stack</label>
+            <input id="techStack" class="setup-input" type="text" placeholder="e.g. Python, FastAPI, PostgreSQL" />
+          </div>
 
-    <!-- Transcript -->
-    <div class="transcript-panel" id="transcriptPanel">
-      <div class="transcript-empty" id="transcriptEmpty">
-        Your conversation will appear here
-      </div>
-    </div>
+          <!-- Submit button — always visible at bottom of form -->
+          <button id="beginBtn" class="begin-btn" type="button">
+            Begin Interview
+          </button>
+        </form>
+      </aside>
 
-  </div>
+      <!-- ── Right Column: Orb + Session UI ── -->
+      <div class="session-column">
+
+        <!-- Orb -->
+        <div class="orb-wrapper" id="orbWrapper" role="button" aria-label="Stop voice interview" tabindex="0">
+          <canvas id="wave-canvas" class="wave-canvas"></canvas>
+          <div class="processing-spinner"></div>
+          <div class="orb" id="orbShaderContainer">
+            <canvas id="shader-canvas" style="display:block;width:100%;height:100%;border-radius:50%;"></canvas>
+          </div>
+        </div>
+
+        <!-- Status — shown once session is live -->
+        <div class="status-area" id="statusArea" style="display:none;">
+          <div class="status-text" id="statusText">Listening…</div>
+          <div class="status-hint" id="statusHint">Speak naturally — I'm hearing you</div>
+        </div>
+
+        <!-- Transcript — shown once first message arrives -->
+        <div class="transcript-panel" id="transcriptPanel" style="display:none;">
+          <div class="transcript-empty" id="transcriptEmpty">
+            Your conversation will appear here
+          </div>
+        </div>
+
+      </div><!-- /.session-column -->
+    </div><!-- /.main-layout -->
+
+  </div><!-- /#appContainer -->
+
 
   <!-- Connection indicator -->
   <div class="connection-status">
     <span class="connection-dot" id="connectionDot"></span>
     <span id="connectionLabel">Disconnected</span>
   </div>
+
+  <!-- WebGL Shader Script -->
+  <script>
+    (function () {
+      const canvas = document.getElementById('shader-canvas');
+
+      function syncSize() {
+        const w = canvas.clientWidth || 200;
+        const h = canvas.clientHeight || 200;
+        if (canvas.width !== w || canvas.height !== h) {
+          canvas.width = w;
+          canvas.height = h;
+        }
+      }
+      if (typeof ResizeObserver !== 'undefined') {
+        new ResizeObserver(syncSize).observe(canvas);
+      }
+      syncSize();
+
+      const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+      if (!gl) return;
+
+      const vs = `attribute vec2 a_position;
+varying vec2 v_texCoord;
+void main() {
+  v_texCoord = a_position * 0.5 + 0.5;
+  gl_Position = vec4(a_position, 0.0, 1.0);
+}`;
+
+      const fs = `precision highp float;
+uniform float u_time;
+uniform vec2 u_resolution;
+uniform vec2 u_mouse;
+uniform float u_intensity;
+varying vec2 v_texCoord;
+
+vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+vec2 mod289(vec2 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+vec3 permute(vec3 x) { return mod289(((x*34.0)+1.0)*x); }
+
+float snoise(vec2 v) {
+  const vec4 C = vec4(0.211324865405187, 0.366025403784439, -0.577350269189626, 0.024390243902439);
+  vec2 i  = floor(v + dot(v, C.yy));
+  vec2 x0 = v - i + dot(i, C.xx);
+  vec2 i1;
+  i1 = (x0.x > x0.y) ? vec2(1.0, 0.0) : vec2(0.0, 1.0);
+  vec4 x12 = x0.xyxy + C.xxzz;
+  x12.xy -= i1;
+  i = mod289(i);
+  vec3 p = permute(permute(i.y + vec3(0.0, i1.y, 1.0)) + i.x + vec3(0.0, i1.x, 1.0));
+  vec3 m = max(0.5 - vec3(dot(x0,x0), dot(x12.xy,x12.xy), dot(x12.zw,x12.zw)), 0.0);
+  m = m*m;
+  m = m*m;
+  vec3 x = 2.0 * fract(p * C.www) - 1.0;
+  vec3 h = abs(x) - 0.5;
+  vec3 a0 = x - floor(x + 0.5);
+  float m1 = 1.79284291400159 - 0.85373472095314 * (a0.x*a0.x + h.x*h.x);
+  m.x *= m1;
+  m.yz *= 1.79284291400159 - 0.85373472095314 * (vec2(a0.y,a0.z)*vec2(a0.y,a0.z) + vec2(h.y,h.z)*vec2(h.y,h.z));
+  vec3 g;
+  g.x  = a0.x  * x0.x  + h.x  * x0.y;
+  g.yz = a0.yz * x12.xz + h.yz * x12.yw;
+  return 130.0 * dot(m, g);
+}
+
+void main() {
+    vec2 uv = v_texCoord;
+    vec2 center = vec2(0.5, 0.5);
+    float dist = distance(uv, center);
+
+    // Sphere mask
+    float sphere = smoothstep(0.45, 0.44, dist);
+
+    // Animate noise — speed reacts to intensity (state)
+    float speed = 0.3 + u_intensity * 1.1;
+    float n = snoise(uv * 2.8 + u_time * speed);
+    n += 0.5 * snoise(uv * 5.5 - u_time * (speed * 1.7));
+    n = n * 0.5 + 0.5; // remap to [0,1]
+
+    // Mouse influence
+    vec2 m = u_mouse / u_resolution;
+    float mouseDist = distance(uv, m);
+    float mouseForce = smoothstep(0.3, 0.0, mouseDist) * 0.04;
+    uv += (uv - m) * mouseForce;
+
+    // ── Obsidian palette ──
+    // Base: deep obsidian #09090B  → charcoal #121214 driven by noise
+    vec3 base0 = vec3(0.035, 0.035, 0.043); // obsidian
+    vec3 base1 = vec3(0.071, 0.071, 0.078); // charcoal-depth
+    // At high intensity shift to slightly lighter iron-grey tones
+    vec3 hi0   = vec3(0.071, 0.071, 0.082);
+    vec3 hi1   = vec3(0.153, 0.153, 0.163); // iron-grey
+
+    vec3 color0 = mix(base0, hi0, u_intensity);
+    vec3 color1 = mix(base1, hi1, u_intensity);
+
+    // Silver accent for glow: #E4E4E7
+    vec3 silver = vec3(0.894, 0.894, 0.906);
+
+    vec3 finalColor = mix(color0, color1, n);
+
+    // Silver sheen layered over noise at intensity
+    finalColor += silver * (n - 0.5) * 0.12 * u_intensity;
+
+    // Rim highlight — thin silver ring at sphere edge
+    float rim = smoothstep(0.35, 0.43, dist) * smoothstep(0.45, 0.40, dist);
+    finalColor += silver * rim * (0.25 + u_intensity * 0.45);
+
+    // Pulsing core — brightest at speaking state
+    float pulseRate = 1.8 + u_intensity * 3.5;
+    float pulse = sin(u_time * pulseRate) * 0.5 + 0.5;
+    float core = smoothstep(0.12, 0.0, dist) * pulse * (0.08 + u_intensity * 0.25);
+    finalColor += silver * core;
+
+    // Subtle inner specular highlight (top-left)
+    vec2 specDir = normalize(vec2(uv.x - 0.35, uv.y - 0.38));
+    float spec = pow(max(0.0, dot(specDir, vec2(0.0, 1.0))), 4.0);
+    float specMask = smoothstep(0.3, 0.05, dist);
+    finalColor += silver * spec * specMask * 0.06;
+
+    gl_FragColor = vec4(finalColor * sphere, sphere);
+}`;
+
+      function createShader(type, src) {
+        const s = gl.createShader(type);
+        gl.shaderSource(s, src);
+        gl.compileShader(s);
+        return s;
+      }
+
+      const prog = gl.createProgram();
+      gl.attachShader(prog, createShader(gl.VERTEX_SHADER, vs));
+      gl.attachShader(prog, createShader(gl.FRAGMENT_SHADER, fs));
+      gl.linkProgram(prog);
+      gl.useProgram(prog);
+
+      const buf = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+      const pos = gl.getAttribLocation(prog, 'a_position');
+      gl.enableVertexAttribArray(pos);
+      gl.vertexAttribPointer(pos, 2, gl.FLOAT, false, 0, 0);
+
+      const uTime = gl.getUniformLocation(prog, 'u_time');
+      const uRes = gl.getUniformLocation(prog, 'u_resolution');
+      const uMouse = gl.getUniformLocation(prog, 'u_mouse');
+      const uIntensity = gl.getUniformLocation(prog, 'u_intensity');
+
+      let mouse = { x: canvas.width / 2, y: canvas.height / 2 };
+      window.addEventListener('mousemove', (event) => {
+        const rect = canvas.getBoundingClientRect();
+        if (rect.width && rect.height) {
+          const nx = (event.clientX - rect.left) / rect.width;
+          const ny = 1.0 - (event.clientY - rect.top) / rect.height;
+          mouse.x = nx * canvas.width;
+          mouse.y = ny * canvas.height;
+        }
+      });
+
+      // Expose intensity control so main.js can drive shader state
+      window.setShaderIntensity = function (val) {
+        window._shaderIntensity = val;
+      };
+      window._shaderIntensity = 0.0;
+
+      // Smooth intensity transitions
+      let currentIntensity = 0.0;
+
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+      function render(t) {
+        syncSize();
+
+        // Smooth lerp toward target intensity
+        const target = window._shaderIntensity || 0.0;
+        currentIntensity += (target - currentIntensity) * 0.05;
+
+        gl.viewport(0, 0, canvas.width, canvas.height);
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+
+        if (uTime) gl.uniform1f(uTime, t * 0.001);
+        if (uRes) gl.uniform2f(uRes, canvas.width, canvas.height);
+        if (uMouse) gl.uniform2f(uMouse, mouse.x, mouse.y);
+        if (uIntensity) gl.uniform1f(uIntensity, currentIntensity);
+
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        requestAnimationFrame(render);
+      }
+      render(0);
+    })();
+  </script>
+
+  <!-- Circular Wave Engine -->
+  <script>
+    (function () {
+      const waveCanvas = document.getElementById('wave-canvas');
+      const ctx = waveCanvas.getContext('2d');
+
+      // ── Config ──────────────────────────────────────────────
+      const ORB_RADIUS = 150;   // half of 300px orb
+      const WAVE_SPEED = 1.4;   // px per frame at 60fps
+      const MAX_RADIUS = 260;   // how far a wave travels before dying
+      const SPAWN_EVERY = 900;   // ms between new wave spawns
+      const WAVE_COLOR = [228, 228, 231]; // --silver-accent
+      // ────────────────────────────────────────────────────────
+
+      let waves = [];   // { r, born }
+      let active = false;
+      let rafId = null;
+      let lastSpawn = 0;
+      let lastFrame = 0;
+
+      function syncSize() {
+        const w = waveCanvas.clientWidth || 480;
+        const h = waveCanvas.clientHeight || 480;
+        if (waveCanvas.width !== w || waveCanvas.height !== h) {
+          waveCanvas.width = w;
+          waveCanvas.height = h;
+        }
+      }
+
+      function spawnWave() {
+        waves.push({ r: ORB_RADIUS });
+      }
+
+      function loop(ts) {
+        rafId = requestAnimationFrame(loop);
+
+        const dt = Math.min(ts - lastFrame, 50); // cap delta to avoid jump on tab switch
+        lastFrame = ts;
+
+        // Spawn new waves while active
+        if (active && ts - lastSpawn > SPAWN_EVERY) {
+          spawnWave();
+          lastSpawn = ts;
+        }
+
+        syncSize();
+        ctx.clearRect(0, 0, waveCanvas.width, waveCanvas.height);
+
+        const cx = waveCanvas.width / 2;
+        const cy = waveCanvas.height / 2;
+
+        // Advance and draw each wave
+        waves = waves.filter(w => w.r < MAX_RADIUS);
+
+        for (const w of waves) {
+          // Progress 0→1 over the wave's travel distance
+          const progress = (w.r - ORB_RADIUS) / (MAX_RADIUS - ORB_RADIUS);
+
+          // Opacity: starts at 0.55, eases to 0 using a smooth curve
+          const alpha = 0.55 * Math.pow(1 - progress, 1.6);
+
+          // Line thinning: 1.5px → 0.4px
+          const lineW = 1.5 - progress * 1.1;
+
+          ctx.beginPath();
+          ctx.arc(cx, cy, w.r, 0, Math.PI * 2);
+          ctx.strokeStyle = `rgba(${WAVE_COLOR[0]},${WAVE_COLOR[1]},${WAVE_COLOR[2]},${alpha.toFixed(3)})`;
+          ctx.lineWidth = Math.max(lineW, 0.3);
+          ctx.stroke();
+
+          // Advance radius proportional to elapsed time (smooth at any fps)
+          w.r += WAVE_SPEED * (dt / 16.67);
+        }
+      }
+
+      // Expose control — called by main.js via setState()
+      window.setWaveActive = function (on) {
+        if (on === active) return;
+        active = on;
+        if (on) {
+          // Immediately spawn first wave so there's no delay on state change
+          spawnWave();
+          lastSpawn = performance.now();
+        } else {
+          // Let existing waves finish fading — don't clear immediately
+        }
+      };
+
+      // Start the loop (waves won't appear until setWaveActive(true))
+      requestAnimationFrame(loop);
+    })();
+  </script>
 
   <script src="main.js"></script>
 </body>

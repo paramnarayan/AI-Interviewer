@@ -1,8 +1,9 @@
 import webrtcvad
+from config import VAD_AGGRESSIVENESS
 
 
 class TurnDetector:
-    def __init__(self, aggressiveness=2, sample_rate=16000, silence_ms=700):
+    def __init__(self, aggressiveness=VAD_AGGRESSIVENESS, sample_rate=16000, silence_ms=2000):
         self.vad = webrtcvad.Vad(aggressiveness)
         self.sample_rate = sample_rate
         self.frame_ms = 30

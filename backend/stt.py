@@ -14,7 +14,7 @@ HALLUCINATIONS = {
 }
 
 
-def transcribe(pcm_bytes: bytes) -> str:
+def transcribe(pcm_bytes: bytes, context_terms: list[str] = None) -> str:
     audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
 
     duration = len(audio) / SAMPLE_RATE_IN
@@ -25,7 +25,13 @@ def transcribe(pcm_bytes: bytes) -> str:
     if rms < MIN_RMS_THRESHOLD:
         return ""
 
-    segments, info = whispermodel.transcribe(audio, language="en", beam_size=1)
+    initial_prompt = None
+    if context_terms:
+        initial_prompt = "Relevant names and terms: " + ", ".join(context_terms)
+
+    segments, info = whispermodel.transcribe(
+        audio, language="en", beam_size=5, initial_prompt=initial_prompt
+    )
     text = " ".join(seg.text for seg in segments).strip()
 
     if text.lower().strip() in HALLUCINATIONS:

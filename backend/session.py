@@ -3,6 +3,9 @@ class InterviewSession:
         self.audio_buffer= bytearray()
         self.history:list[dict] = []
         self.session_id = session_id
+        self.profile: dict={}
+    def set_profile(self,profile:dict):
+        self.profile = profile
 
     def add_user_turn( self,text:str):
         self.history.append({"role": "user", "content": text})

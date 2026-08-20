@@ -1,5 +1,7 @@
 .env
-
+.venv
 *.pyc
-personal
+personal 
 venv
+.vscode
+__pycache__
