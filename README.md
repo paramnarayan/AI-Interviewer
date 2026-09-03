@@ -1,6 +1,6 @@
 # AI Voice Interviewer
 
-An end-to-end, real-time voice interview application built with FastAPI WebSockets, Web Audio API, Voice Activity Detection (VAD), Speech-to-Text (faster-whisper), LLM streaming (Groq API), and Text-to-Speech (Kokoro-82M).
+An end-to-end, real-time voice interview application built with FastAPI WebSockets, Web Audio API, Voice Activity Detection (VAD), Speech-to-Text (faster-whisper), LLM streaming (Groq API), Text-to-Speech (Kokoro-82M), SQLite persistence, and Redis session storage.
 
 ---
 
@@ -10,6 +10,7 @@ An end-to-end, real-time voice interview application built with FastAPI WebSocke
 - [Architecture & System Flow](#architecture--system-flow)
 - [Technical Stack & Components](#technical-stack--components)
 - [Pipeline Mechanics](#pipeline-mechanics)
+- [REST API Endpoints](#rest-api-endpoints)
 - [Prerequisites & Dependencies](#prerequisites--dependencies)
 - [Installation & Setup](#installation--setup)
 - [Running the Application](#running-the-application)
@@ -21,11 +22,13 @@ An end-to-end, real-time voice interview application built with FastAPI WebSocke
 
 ## Overview
 
-AI Voice Interviewer enables low-latency, bidirectional conversational mock interviews. Before starting, the user fills out a short setup form (name, target role, company, tech stack). These profile details are sent to the backend as the first WebSocket message and are used to personalize the AI interviewer's questions and system prompt throughout the session.
+AI Voice Interviewer enables low-latency, bidirectional conversational mock interviews. Before starting, the user fills out a short setup form (name, target role, company, tech stack) and optionally uploads their **resume as a PDF** for context-aware, personalized questions. These profile details — including extracted resume text — are sent to the backend as the first WebSocket message and are used to personalize the AI interviewer's questions and system prompt throughout the session.
 
 Once the session begins, users speak naturally through their browser; incoming audio is captured at 16 kHz, converted into raw Linear PCM bytes via an AudioWorklet, and streamed over a full-duplex WebSocket connection.
 
 The backend uses a Voice Activity Detector (webrtcvad) with an internal frame buffer to detect turn completion. Transcriptions from faster-whisper are processed by a Groq-hosted Qwen language model with hidden reasoning format. The response tokens are incrementally synthesized into 24 kHz audio chunks using Kokoro TTS on sentence boundaries, providing rapid Time-to-First-Audio (TTFA) and smooth conversational turn-taking.
+
+All sessions are persisted to a **SQLite database** (via SQLAlchemy async) and conversation state is backed by **Redis** for reconnect resilience. Past interview transcripts and summaries are retrievable via a REST history endpoint.
 
 At the end of a session, the user can click **End Interview & Get Summary** to receive a structured AI-generated performance critique covering strengths, areas to improve, communication notes, and suggested next steps.
 
@@ -56,6 +59,9 @@ At the end of a session, the user can click **End Interview & Get Summary** to r
                                          v
 +-----------------------------------------------------------------------------------+
 |                                 SERVER (FASTAPI)                                  |
+|                                                                                   |
+|  POST /upload-resume --> pdfplumber --> { resume_text }                           |
+|  GET  /history/{name} --> SQLite --> interview history JSON                       |
 |                                                                                   |
 |  +-----------------------------------------------------------------------------+  |
 |  | WebSocket Route: /ws/interview                                              |  |
@@ -88,7 +94,9 @@ At the end of a session, the user can click **End Interview & Get Summary** to r
 |                                              | (Synthesizer) |                    |
 |                                              +---------------+                    |
 |                                                                                   |
-|  [ end_interview JSON ] --> generate_summary() --> summary JSON --> client       |
+|  [ end_interview JSON ] --> generate_summary() --> SQLite + summary JSON --> client |
+|                                                                                   |
+|  Redis: session history/profile persisted per-turn (TTL 24h, reconnect-safe)     |
 +-----------------------------------------------------------------------------------+
 ```
 
@@ -111,51 +119,72 @@ A canvas-based animation emits concentric ripple rings outward from the orb duri
 
 ### Server Side (`backend/`)
 
-- `server.py`: FastAPI application hosting the WebSocket endpoint `/ws/interview` and static asset serving. On connection, reads the setup JSON profile as the first message, then enters the main audio loop. Handles both binary PCM frames and JSON control messages (`end_interview`). Offloads synchronous compute to worker threads via `asyncio.to_thread`.
+- `server.py`: FastAPI application hosting the WebSocket endpoint `/ws/interview`, the resume upload router, history endpoint, and static asset serving. On connection, reads the setup JSON profile as the first message, creates a persisted interview record in SQLite, then enters the main audio loop. Handles both binary PCM frames and JSON control messages (`end_interview`). Offloads synchronous compute to worker threads via `asyncio.to_thread`.
 - `vad.py`: `TurnDetector` wrapping `webrtcvad`. Configurable `aggressiveness` level (default: `1`). Buffers streaming byte chunks into 30 ms frames (960 bytes at 16 kHz) and triggers an end-of-turn event after 1000 ms of silence.
 - `stt.py`: Automated speech recognition wrapping `faster-whisper` (`small.en`, `int8` on CPU). Includes audio duration checks, RMS energy threshold validation, and hallucination suppression. Accepts an optional `context_terms` list (populated from the session profile — name, company, tech stack) which is injected as `initial_prompt` for improved transcription accuracy of domain-specific terminology. Uses `beam_size=5` for higher transcription quality.
-- `llm.py`: Asynchronous streaming interface to Groq Cloud (`qwen/qwen3.6-27b`), configured with `reasoning_format="hidden"`. The system prompt is dynamically built from the session profile via `SystemPrompt()`, tailoring question focus to the candidate's name, role, company, and tech stack. Also provides `generate_summary()` — a non-streaming call that produces a structured JSON performance critique after the session ends.
+- `llm.py`: Asynchronous streaming interface to Groq Cloud (`qwen/qwen3.6-27b`), configured with `reasoning_format="hidden"`. The system prompt is dynamically built from the session profile via `SystemPrompt()`, tailoring question focus to the candidate's name, role, company, tech stack, and optionally the uploaded resume text. Also provides `generate_summary()` — a non-streaming call that produces a structured JSON performance critique after the session ends.
 - `tts.py`: Speech synthesis using `Kokoro-82M` (American English `af_heart` voice), generating 24 kHz PCM16 audio buffers.
-- `session.py`: In-memory state container managing dialogue history, turn-level audio accumulation, and the session profile dict.
+- `session.py`: Session state container managing dialogue history, turn-level audio accumulation, and the session profile dict. Persists history and profile to **Redis** (keyed by `session_id`, TTL 24 h) after every completed turn, enabling reconnect recovery. Provides `save()`, `load()`, and `clear()` methods.
+- `database.py`: Async SQLAlchemy layer backed by SQLite (`interviews.db`). Defines `InterviewRecord` and `MessageRecord` ORM models. Provides `init_db()`, `create_interview_record()`, `save_message()`, `save_summary()`, and `get_user_interview_history()`. Database URL is overridable via `DATABASE_URL` env var.
+- `routers/resume.py`: `POST /upload-resume` endpoint. Accepts a PDF file upload, validates MIME type, extracts plain text via `pdfplumber` (capped at 4,000 characters), and returns `{ "resume_text": "..." }`. The extracted text is passed in the session setup message and injected into the LLM system prompt.
 - `config.py`: Environment loader and system parameter definitions, including `VAD_AGGRESSIVENESS`.
 
 ---
 
 ## Pipeline Mechanics
 
-1. **Session Setup**:
-   - The user fills in their name, target role, optional company, and tech stack in the setup form.
-   - On clicking **Begin Interview**, the form is validated, a WebSocket connection is established, and the profile JSON is sent as the very first message to the server.
-   - The server calls `session.set_profile()` and extracts context terms (name, company, tech stack tokens) for use in STT prompting.
+1. **Resume Upload (Optional)**:
+   - Before the interview, the user can upload a PDF resume via `POST /upload-resume`.
+   - The server validates the file, extracts up to 4,000 characters of plain text using `pdfplumber`, and returns `{ "resume_text": "..." }`.
+   - The frontend includes this `resume_text` in the setup JSON payload sent at interview start.
 
-2. **Audio Ingestion**:
+2. **Session Setup**:
+   - The user fills in their name, target role, optional company, and tech stack in the setup form.
+   - On clicking **Begin Interview**, the form is validated, a WebSocket connection is established, and the profile JSON (including optional `resume_text`) is sent as the very first message to the server.
+   - The server calls `session.set_profile()`, creates a persisted `InterviewRecord` in SQLite, and saves the initial session state to Redis.
+   - Context terms (name, company, tech stack tokens) are extracted for use in STT prompting.
+
+3. **Audio Ingestion**:
    - The browser captures microphone audio at 16,000 Hz.
    - `PCMProcessor` quantizes `Float32` chunks to `Int16` buffers and streams binary frames over the WebSocket during the `listening` state.
 
-3. **Voice Activity Detection**:
+4. **Voice Activity Detection**:
    - `TurnDetector` buffers incoming bytes and evaluates 30 ms slices (480 samples / 960 bytes) using aggressiveness level `1`.
    - Once speech has commenced, the detector monitors for 1000 ms of consecutive silence (33 frames).
    - Upon silence confirmation, the turn is finalized, and accumulated bytes are passed to STT.
 
-4. **Validation & Speech-to-Text**:
+5. **Validation & Speech-to-Text**:
    - Audio is verified against a minimum duration (0.5 s) and minimum RMS energy threshold (0.01) to eliminate silent background noise.
    - `faster-whisper` executes greedy transcription with `beam_size=5`.
    - If `context_terms` are available, an `initial_prompt` is prepended to help the model correctly transcribe names, companies, and stack-specific terminology.
    - Known subtitle hallucinations (e.g., "Thank you", "Thanks for watching") are rejected.
 
-5. **Streaming LLM & Chunked Synthesis**:
-   - Transcribed text is added to the conversation history and sent to the Groq API (Qwen 3.6-27B) with a profile-personalized system prompt.
+6. **Streaming LLM & Chunked Synthesis**:
+   - Transcribed text is added to the conversation history and sent to the Groq API (Qwen 3.6-27B) with a profile-personalized system prompt (which includes resume text if provided).
    - As tokens stream back, they accumulate in a sentence buffer.
    - When sentence terminators (`.`, `?`, `!`) are encountered, the segment is immediately synthesized into 24 kHz PCM audio and dispatched to the client.
+   - Each completed user and assistant turn is saved to both Redis (for session resilience) and SQLite (for persistent history).
 
-6. **Scheduled Gapless Playback**:
+7. **Scheduled Gapless Playback**:
    - The browser receives binary audio chunks, normalizes them to `Float32Array`, and schedules them sequentially using Web Audio timeline timestamps (`playbackQueueTime`).
 
-7. **End Interview & Summary**:
+8. **End Interview & Summary**:
    - The user clicks **End Interview & Get Summary**; the client sends `{"type": "end_interview"}` over the WebSocket.
    - The server calls `generate_summary(session)`, which submits the conversation transcript to the Groq API and receives a structured JSON object.
-   - The JSON is sent back as `{"type": "summary", "data": {...}}` and rendered in the Summary Modal with sections for Overall Impression, Strengths, Areas to Improve, Communication Notes, and Next Steps.
+   - The summary JSON is persisted to SQLite (`save_summary`) and sent back as `{"type": "summary", "data": {...}}`.
+   - The summary is rendered in the Summary Modal with sections for Overall Impression, Strengths, Areas to Improve, Communication Notes, and Next Steps.
+   - The Redis session keys are deleted (`session.clear()`) after the summary is dispatched.
    - On error, a `{"type": "summary_error"}` message is sent and the modal shows a fallback error state.
+
+---
+
+## REST API Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/upload-resume` | Upload a PDF resume; returns `{ "resume_text": "..." }` (max 4,000 chars) |
+| `GET` | `/history/{candidate_name}` | Retrieve all past interview records for a candidate, including messages and summaries |
+| `WS` | `/ws/interview` | Full-duplex WebSocket for the live interview session |
 
 ---
 
@@ -165,6 +194,7 @@ A canvas-based animation emits concentric ripple rings outward from the orb duri
 - Python 3.10+ (tested on Python 3.12)
 - Modern Web Browser with Web Audio API, AudioWorklet, and WebGL support
 - Groq API Key
+- Redis server (for session persistence; defaults to `redis://localhost:6379`)
 
 ### Core Python Packages
 - `fastapi`
@@ -176,7 +206,11 @@ A canvas-based animation emits concentric ripple rings outward from the orb duri
 - `kokoro`
 - `soundfile`
 - `numpy`
-- `torch`
+- `pdfplumber`
+- `python-multipart`
+- `sqlalchemy[asyncio]`
+- `aiosqlite`
+- `redis[asyncio]`
 
 ---
 
@@ -196,15 +230,29 @@ source venv/bin/activate
 
 ### 3. Install Dependencies
 ```bash
-pip install -r requirements.txt
 pip install -r backend/requirements.txt
 ```
 
-### 4. Configure Environment Variables
-Create a `.env` file in the project root:
+### 4. Start Redis
+A running Redis instance is required for session persistence:
+```bash
+# macOS (Homebrew)
+brew install redis && brew services start redis
+
+# Or via Docker
+docker run -d -p 6379:6379 redis:alpine
+```
+
+### 5. Configure Environment Variables
+Create a `.env` file in the `backend/` directory (or project root):
 ```env
 GROQ_API_KEY=your_groq_api_key_here
 GROQ_MODEL=qwen/qwen3.6-27b
+
+# Optional overrides
+REDIS_URL=redis://localhost:6379
+REDIS_SESSION_TTL_S=86400
+DATABASE_URL=sqlite+aiosqlite:///./interviews.db
 ```
 
 ---
@@ -290,9 +338,9 @@ Endpoint: `ws://<host>:<port>/ws/interview`
 
 ## Configuration Reference
 
-Key settings located in `backend/config.py`:
+Key settings in `backend/config.py` and overridable environment variables:
 
-| Parameter | Default Value | Description |
+| Parameter / Env Var | Default Value | Description |
 |---|---|---|
 | `GROQ_MODEL` | `qwen/qwen3.6-27b` | Large language model endpoint hosted on Groq |
 | `WHISPER_MODEL_SIZE` | `small.en` | faster-whisper model variant |
@@ -304,13 +352,19 @@ Key settings located in `backend/config.py`:
 | `SAMPLE_RATE_OUT` | `24000` | Output playback synthesis rate (Hz) |
 | `VAD_SILENCE_MS` | `1000` | Silence duration required to conclude user turn (ms) |
 | `VAD_AGGRESSIVENESS` | `1` | webrtcvad aggressiveness level (0–3; higher = more aggressive noise filtering) |
+| `REDIS_URL` | `redis://localhost:6379` | Redis connection URL for session persistence |
+| `REDIS_SESSION_TTL_S` | `86400` | Session TTL in Redis (seconds; default 24 h) |
+| `DATABASE_URL` | `sqlite+aiosqlite:///./interviews.db` | SQLAlchemy async database URL |
 
 ---
 
 ## Engineering Highlights
 
+- **Resume-Aware Personalization**: Users can upload a PDF resume before the interview. `pdfplumber` extracts up to 4,000 characters of text, which is injected into the LLM system prompt alongside the profile, enabling the AI to ask targeted, resume-specific questions.
 - **Profile-Personalized Interviews**: The session profile (name, role, company, tech stack) dynamically generates the LLM system prompt, produces role-tailored questions, and seeds the Whisper `initial_prompt` to improve transcription of domain-specific terms.
-- **AI Performance Summary**: At session end, the full conversation history is submitted to the LLM for a structured JSON critique — covering strengths, improvement areas, communication quality, and actionable next steps — rendered in a polished summary modal.
+- **SQLite Interview Persistence**: Every interview, message, and summary is stored to a local SQLite database via async SQLAlchemy. Past sessions are queryable by candidate name through the `GET /history/{candidate_name}` REST endpoint.
+- **Redis Session Resilience**: Conversation history and profile are written to Redis after every completed turn (TTL 24 h). This allows session state to survive backend restarts and supports reconnect-based recovery via `session.load()`.
+- **AI Performance Summary**: At session end, the full conversation history is submitted to the LLM for a structured JSON critique — covering strengths, improvement areas, communication quality, and actionable next steps — persisted to SQLite and rendered in a polished summary modal.
 - **WebGL Shader Orb**: An inline GLSL simplex-noise shader drives the orb's visual state. The `u_intensity` uniform (smoothly lerped in the render loop) modulates noise speed, color depth, rim glow, and core pulse across all four app states without any CSS or DOM overhead.
 - **Circular Wave Engine**: A canvas-based ripple system emits concentric rings during active states. Wave lifecycle (spawn interval, travel distance, opacity easing, line thinning) is fully frame-rate-independent via delta-time scaling.
 - **Feedback Loop Mitigation**: Client-side mic streaming is gated to the `listening` state only, preventing speaker output from re-entering the microphone during `processing` and `speaking` states.
