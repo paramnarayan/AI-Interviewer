@@ -14,15 +14,12 @@
 
   <div class="app-container" id="appContainer">
 
-    <!-- Header -->
     <header class="app-header">
       <h1><span class="brand-accent">Interview Coach</span></h1>
     </header>
 
-    <!-- Two-column layout: form left, orb right -->
     <div class="main-layout">
 
-      <!-- ── Left Panel: Setup Form ── -->
       <aside class="form-panel" id="formPanel">
         <div class="form-panel-header">
           <p class="form-panel-title">Interview Setup</p>
@@ -49,17 +46,30 @@
             <input id="techStack" class="setup-input" type="text" placeholder="e.g. Python, FastAPI, PostgreSQL" />
           </div>
 
-          <!-- Submit button — always visible at bottom of form -->
+          <div class="setup-field">
+            <label class="setup-label" for="resumeFile">
+              Resume <span class="setup-optional">optional</span>
+            </label>
+            <label class="resume-drop-zone" id="resumeDropZone" for="resumeFile" role="button" tabindex="0" aria-label="Upload your resume PDF">
+              <input id="resumeFile" type="file" accept=".pdf,application/pdf" hidden />
+              <span class="resume-drop-icon" aria-hidden="true">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+                </svg>
+              </span>
+              <span class="resume-drop-text" id="resumeDropText">Click to upload PDF</span>
+            </label>
+            <div class="resume-status" id="resumeStatus" aria-live="polite"></div>
+          </div>
+
           <button id="beginBtn" class="begin-btn" type="button">
             Begin Interview
           </button>
         </form>
       </aside>
 
-      <!-- ── Right Column: Orb + Session UI ── -->
       <div class="session-column">
 
-        <!-- Orb -->
         <div class="orb-wrapper" id="orbWrapper" role="button" aria-label="Stop voice interview" tabindex="0">
           <canvas id="wave-canvas" class="wave-canvas"></canvas>
           <div class="processing-spinner"></div>
@@ -68,31 +78,27 @@
           </div>
         </div>
 
-        <!-- Status — shown once session is live -->
         <div class="status-area" id="statusArea" style="display:none;">
           <div class="status-text" id="statusText">Listening…</div>
           <div class="status-hint" id="statusHint">Speak naturally — I'm hearing you</div>
         </div>
 
-        <!-- Transcript — shown once first message arrives -->
         <div class="transcript-panel" id="transcriptPanel" style="display:none;">
           <div class="transcript-empty" id="transcriptEmpty">
             Your conversation will appear here
           </div>
         </div>
 
-        <!-- End Interview button — shown during active session -->
         <button id="endInterviewBtn" class="end-interview-btn" style="display:none;">
           End Interview &amp; Get Summary
         </button>
 
-      </div><!-- /.session-column -->
-    </div><!-- /.main-layout -->
+      </div>
+    </div>
 
-  </div><!-- /#appContainer -->
+  </div>
 
 
-  <!-- Summary Modal -->
   <div id="summaryModal" class="summary-modal" style="display:none;">
     <div class="summary-card">
       <div class="summary-card-header">
@@ -134,13 +140,11 @@
     </div>
   </div>
 
-  <!-- Connection indicator -->
   <div class="connection-status">
     <span class="connection-dot" id="connectionDot"></span>
     <span id="connectionLabel">Disconnected</span>
   </div>
 
-  <!-- WebGL Shader Script -->
   <script>
     (function () {
       const canvas = document.getElementById('shader-canvas');
@@ -209,51 +213,40 @@ void main() {
     vec2 center = vec2(0.5, 0.5);
     float dist = distance(uv, center);
 
-    // Sphere mask
     float sphere = smoothstep(0.45, 0.44, dist);
 
-    // Animate noise — speed reacts to intensity (state)
     float speed = 0.3 + u_intensity * 1.1;
     float n = snoise(uv * 2.8 + u_time * speed);
     n += 0.5 * snoise(uv * 5.5 - u_time * (speed * 1.7));
-    n = n * 0.5 + 0.5; // remap to [0,1]
+    n = n * 0.5 + 0.5;
 
-    // Mouse influence
     vec2 m = u_mouse / u_resolution;
     float mouseDist = distance(uv, m);
     float mouseForce = smoothstep(0.3, 0.0, mouseDist) * 0.04;
     uv += (uv - m) * mouseForce;
 
-    // ── Obsidian palette ──
-    // Base: deep obsidian #09090B  → charcoal #121214 driven by noise
-    vec3 base0 = vec3(0.035, 0.035, 0.043); // obsidian
-    vec3 base1 = vec3(0.071, 0.071, 0.078); // charcoal-depth
-    // At high intensity shift to slightly lighter iron-grey tones
+    vec3 base0 = vec3(0.035, 0.035, 0.043);
+    vec3 base1 = vec3(0.071, 0.071, 0.078);
     vec3 hi0   = vec3(0.071, 0.071, 0.082);
-    vec3 hi1   = vec3(0.153, 0.153, 0.163); // iron-grey
+    vec3 hi1   = vec3(0.153, 0.153, 0.163);
 
     vec3 color0 = mix(base0, hi0, u_intensity);
     vec3 color1 = mix(base1, hi1, u_intensity);
 
-    // Silver accent for glow: #E4E4E7
     vec3 silver = vec3(0.894, 0.894, 0.906);
 
     vec3 finalColor = mix(color0, color1, n);
 
-    // Silver sheen layered over noise at intensity
     finalColor += silver * (n - 0.5) * 0.12 * u_intensity;
 
-    // Rim highlight — thin silver ring at sphere edge
     float rim = smoothstep(0.35, 0.43, dist) * smoothstep(0.45, 0.40, dist);
     finalColor += silver * rim * (0.25 + u_intensity * 0.45);
 
-    // Pulsing core — brightest at speaking state
     float pulseRate = 1.8 + u_intensity * 3.5;
     float pulse = sin(u_time * pulseRate) * 0.5 + 0.5;
     float core = smoothstep(0.12, 0.0, dist) * pulse * (0.08 + u_intensity * 0.25);
     finalColor += silver * core;
 
-    // Subtle inner specular highlight (top-left)
     vec2 specDir = normalize(vec2(uv.x - 0.35, uv.y - 0.38));
     float spec = pow(max(0.0, dot(specDir, vec2(0.0, 1.0))), 4.0);
     float specMask = smoothstep(0.3, 0.05, dist);
@@ -298,13 +291,11 @@ void main() {
         }
       });
 
-      // Expose intensity control so main.js can drive shader state
       window.setShaderIntensity = function (val) {
         window._shaderIntensity = val;
       };
       window._shaderIntensity = 0.0;
 
-      // Smooth intensity transitions
       let currentIntensity = 0.0;
 
       gl.enable(gl.BLEND);
@@ -313,7 +304,6 @@ void main() {
       function render(t) {
         syncSize();
 
-        // Smooth lerp toward target intensity
         const target = window._shaderIntensity || 0.0;
         currentIntensity += (target - currentIntensity) * 0.05;
 
@@ -333,23 +323,19 @@ void main() {
     })();
   </script>
 
-  <!-- Circular Wave Engine -->
   <script>
     (function () {
       const waveCanvas = document.getElementById('wave-canvas');
       const ctx = waveCanvas.getContext('2d');
 
-      // ── Config ──────────────────────────────────────────────
-      const ORB_RADIUS = 150;   // half of 300px orb
-      const WAVE_SPEED = 1.4;   // px per frame at 60fps
-      const MAX_RADIUS = 260;   // how far a wave travels before dying
-      const SPAWN_EVERY = 900;   // ms between new wave spawns
-      const WAVE_COLOR = [228, 228, 231]; // --silver-accent
-      // ────────────────────────────────────────────────────────
+      const ORB_RADIUS = 150;
+      const WAVE_SPEED = 1.4;
+      const MAX_RADIUS = 260;
+      const SPAWN_EVERY = 900;
+      const WAVE_COLOR = [228, 228, 231];
 
-      let waves = [];   // { r, born }
+      let waves = [];
       let active = false;
-      let rafId = null;
       let lastSpawn = 0;
       let lastFrame = 0;
 
@@ -367,12 +353,11 @@ void main() {
       }
 
       function loop(ts) {
-        rafId = requestAnimationFrame(loop);
+        requestAnimationFrame(loop);
 
-        const dt = Math.min(ts - lastFrame, 50); // cap delta to avoid jump on tab switch
+        const dt = Math.min(ts - lastFrame, 50);
         lastFrame = ts;
 
-        // Spawn new waves while active
         if (active && ts - lastSpawn > SPAWN_EVERY) {
           spawnWave();
           lastSpawn = ts;
@@ -384,17 +369,11 @@ void main() {
         const cx = waveCanvas.width / 2;
         const cy = waveCanvas.height / 2;
 
-        // Advance and draw each wave
         waves = waves.filter(w => w.r < MAX_RADIUS);
 
         for (const w of waves) {
-          // Progress 0→1 over the wave's travel distance
           const progress = (w.r - ORB_RADIUS) / (MAX_RADIUS - ORB_RADIUS);
-
-          // Opacity: starts at 0.55, eases to 0 using a smooth curve
           const alpha = 0.55 * Math.pow(1 - progress, 1.6);
-
-          // Line thinning: 1.5px → 0.4px
           const lineW = 1.5 - progress * 1.1;
 
           ctx.beginPath();
@@ -403,25 +382,19 @@ void main() {
           ctx.lineWidth = Math.max(lineW, 0.3);
           ctx.stroke();
 
-          // Advance radius proportional to elapsed time (smooth at any fps)
           w.r += WAVE_SPEED * (dt / 16.67);
         }
       }
 
-      // Expose control — called by main.js via setState()
       window.setWaveActive = function (on) {
         if (on === active) return;
         active = on;
         if (on) {
-          // Immediately spawn first wave so there's no delay on state change
           spawnWave();
           lastSpawn = performance.now();
-        } else {
-          // Let existing waves finish fading — don't clear immediately
         }
       };
 
-      // Start the loop (waves won't appear until setWaveActive(true))
       requestAnimationFrame(loop);
     })();
   </script>

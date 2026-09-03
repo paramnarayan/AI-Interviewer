@@ -279,6 +279,100 @@ body::before {
 
 
 
+/* ---------- Resume Upload ---------- */
+
+.resume-drop-zone {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--charcoal-depth);
+  border: 1px dashed var(--iron-grey);
+  border-radius: 8px;
+  padding: 11px 14px;
+  cursor: pointer;
+  transition: border-color 0.2s ease, background 0.2s ease, box-shadow 0.2s ease;
+  user-select: none;
+  width: 100%;
+}
+
+.resume-drop-zone:hover,
+.resume-drop-zone:focus-visible {
+  border-color: var(--outline);
+  background: var(--surface-container-low);
+  box-shadow: 0 0 0 1px rgba(228, 228, 231, 0.06);
+  outline: none;
+}
+
+/* Success state — subtle emerald tint */
+.resume-drop-zone[data-upload-state="success"] {
+  border-color: var(--success-emerald);
+  border-style: solid;
+}
+
+/* Error state — subtle crimson tint */
+.resume-drop-zone[data-upload-state="error"] {
+  border-color: var(--error-crimson);
+  border-style: solid;
+}
+
+/* Loading state */
+.resume-drop-zone[data-upload-state="loading"] {
+  border-color: var(--outline-variant);
+  cursor: wait;
+  animation: resumePulse 1.2s ease-in-out infinite;
+}
+
+@keyframes resumePulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.55; }
+}
+
+.resume-drop-icon {
+  color: var(--outline);
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  transition: color 0.2s ease;
+}
+
+.resume-drop-zone[data-upload-state="success"] .resume-drop-icon {
+  color: var(--success-emerald);
+}
+
+.resume-drop-zone[data-upload-state="error"] .resume-drop-icon {
+  color: var(--error-crimson);
+}
+
+.resume-drop-text {
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--on-surface-var);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1;
+}
+
+/* Status badge below the drop zone */
+.resume-status {
+  font-size: 11px;
+  font-weight: 500;
+  min-height: 16px;
+  letter-spacing: 0.02em;
+  color: transparent;
+  transition: color 0.2s ease;
+}
+
+.resume-status--success {
+  color: var(--success-emerald);
+}
+
+.resume-status--error {
+  color: var(--error-crimson);
+}
+
+
+
 /* ---------- Header ---------- */
 .app-header {
   text-align: center;
@@ -472,14 +566,14 @@ body::before {
   font-weight: 600;
   letter-spacing: 0.05em;
   text-transform: uppercase;
-  color: var(--outline);
+  color: var(--on-surface-var);
   transition: var(--transition-smooth);
 }
 
 .status-hint {
   font-size: 12px;
   font-weight: 400;
-  color: var(--outline-variant);
+  color: var(--outline);
   letter-spacing: 0.01em;
 }
 
@@ -500,12 +594,12 @@ body::before {
   width: 100%;
   max-height: 200px;
   overflow-y: auto;
-  background: var(--charcoal-depth);
-  border: 1px solid var(--iron-grey);
+  background: var(--surface-container-low);
+  border: 1px solid var(--surface-container-high);
   border-radius: 16px;
   padding: 16px 20px;
   scrollbar-width: thin;
-  scrollbar-color: var(--iron-grey) transparent;
+  scrollbar-color: var(--surface-bright) transparent;
 }
 
 .transcript-panel::-webkit-scrollbar {
@@ -546,7 +640,7 @@ body::before {
   text-transform: uppercase;
   letter-spacing: 0.1em;
   margin-bottom: 4px;
-  color: var(--outline);
+  color: var(--on-surface-var);
 }
 
 .transcript-label.user {
@@ -560,8 +654,8 @@ body::before {
 .transcript-content {
   font-size: 14px;
   font-weight: 400;
-  color: var(--on-surface);
-  line-height: 1.55;
+  color: var(--silver-accent);
+  line-height: 1.6;
 }
 
 @keyframes fadeInUp {
@@ -668,6 +762,7 @@ body::before {
   cursor: pointer;
   transition: border-color 0.2s ease, color 0.2s ease, background 0.2s ease;
   width: 100%;
+  margin-top: -20px;
 }
 
 .end-interview-btn:hover {
@@ -692,8 +787,13 @@ body::before {
 }
 
 @keyframes modalFadeIn {
-  from { opacity: 0; }
-  to   { opacity: 1; }
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
 }
 
 .summary-card {
@@ -712,8 +812,15 @@ body::before {
 }
 
 @keyframes cardSlideUp {
-  from { opacity: 0; transform: translateY(24px); }
-  to   { opacity: 1; transform: translateY(0); }
+  from {
+    opacity: 0;
+    transform: translateY(24px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .summary-card-header {
@@ -827,9 +934,17 @@ body::before {
   border-radius: 50%;
 }
 
-.summary-list--positive li::before { background: var(--success-emerald); }
-.summary-list--improve  li::before { background: #F59E0B; }
-.summary-list--steps    li::before { background: var(--silver-accent); }
+.summary-list--positive li::before {
+  background: var(--success-emerald);
+}
+
+.summary-list--improve li::before {
+  background: #F59E0B;
+}
+
+.summary-list--steps li::before {
+  background: var(--silver-accent);
+}
 
 .summary-error {
   padding: 32px 24px;

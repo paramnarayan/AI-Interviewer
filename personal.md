@@ -1,687 +1,364 @@
-# Technical Architecture & Codebase Deep-Dive Guide
+# AI Voice Interviewer — Complete Codebase Reference
 
-This document provides a thorough, component-by-component explanation of the AI Voice Interviewer codebase. It is designed to serve as both an architectural reference and an interview preparation guide covering real-time voice agent design, Web Audio pipelines, streaming inference, and concurrency.
-
----
-
-## Table of Contents
-
-1. [High-Level Architecture & Design Principles](#1-high-level-architecture--design-principles)
-2. [Backend Deep-Dive](#2-backend-deep-dive)
-   - [backend/server.py](#backendserverpy)
-   - [backend/vad.py](#backendvadpy)
-   - [backend/stt.py](#backendsttpy)
-   - [backend/llm.py](#backendllmpy)
-   - [backend/tts.py](#backendttspy)
-   - [backend/session.py](#backendsessionpy)
-   - [backend/config.py](#backendconfigpy)
-3. [Frontend Deep-Dive](#3-frontend-deep-dive)
-   - [frontend/index.html](#frontendindexhtml)
-   - [frontend/style.css](#frontendstylecss)
-   - [frontend/pcm-worklet.js](#frontendpcm-workletjs)
-   - [frontend/main.js](#frontendmainjs)
-4. [Audio DSP & Pipeline Mechanics](#4-audio-dsp--pipeline-mechanics)
-5. [Concurrency & Non-Blocking Design](#5-concurrency--non-blocking-design)
-6. [Key Engineering Challenges & Solutions](#6-key-engineering-challenges--solutions)
-7. [Technical Interview Questions & Answers](#7-technical-interview-questions--answers)
+Personal notes for understanding every part of this project.
 
 ---
 
-## 1. High-Level Architecture & Design Principles
+## Project Layout
 
-The application is structured as a full-duplex, low-latency streaming pipeline:
-
-1. **Client Audio Capture**: The browser captures microphone audio at 16 kHz using the Web Audio API. An `AudioWorkletProcessor` converts 32-bit floating point audio into signed 16-bit Linear PCM bytes and streams them over a persistent WebSocket connection.
-2. **Turn Detection**: The backend receives raw chunks and buffers them into exact 30 ms frames (960 bytes). `webrtcvad` classifies frames as speech or non-speech. When speech is followed by 700 ms of continuous silence, an end-of-turn is triggered.
-3. **Speech-to-Text (STT)**: The accumulated turn audio is validated through duration, energy (RMS), and hallucination filters before passing to `faster-whisper` for transcription.
-4. **Streaming LLM**: Transcribed text is added to the conversation history and passed to the Groq API (`openai/gpt-oss-20b`), which streams response tokens back asynchronously.
-5. **Sentence-Level TTS Chunking**: Rather than waiting for the entire LLM response to complete, tokens accumulate into sentences (split on `.`, `?`, `!`). Each sentence is synthesized immediately by Kokoro TTS into 24 kHz PCM audio and streamed back to the browser.
-6. **Scheduled Audio Playback**: The client receives binary PCM chunks and schedules them gaplessly on the Web Audio timeline using precise time offsets.
+```
+ai voice interviewer/
+├── .env                        # API keys (gitignored)
+├── .gitignore
+├── requirements.txt            # Root-level (thin); backend/ has the real one
+├── backend/
+│   ├── requirements.txt        # All Python deps
+│   ├── config.py               # Central config — reads .env + sets defaults
+│   ├── server.py               # FastAPI app, WebSocket handler, REST endpoints
+│   ├── session.py              # Per-interview in-memory state + Redis persistence
+│   ├── database.py             # SQLAlchemy async ORM — permanent interview history
+│   ├── llm.py                  # Groq LLM: system prompt builder, streaming reply, summary
+│   ├── stt.py                  # Speech-to-text via faster-whisper (runs on CPU)
+│   ├── tts.py                  # Text-to-speech via Kokoro (runs on CPU)
+│   ├── vad.py                  # Voice activity detection via Silero VAD
+│   └── routers/
+│       ├── __init__.py
+│       └── resume.py           # POST /upload-resume endpoint
+└── frontend/
+    ├── index.html              # Single-page app shell + WebGL shader + wave engine
+    ├── main.js                 # All application logic (WS, audio, state machine)
+    ├── style.css               # Obsidian design system + all component styles
+    └── pcm-worklet.js          # AudioWorklet that forwards mic PCM to the WebSocket
+```
 
 ---
 
-## 2. Backend Deep-Dive
+## How a Full Interview Session Works (End to End)
 
-### `backend/server.py`
-
-#### Purpose
-The core ASGI server coordinating the WebSocket lifecycle, event-driven audio ingestion, turn detection, model dispatching, and static file hosting.
-
-#### Detailed Code Explanation
-
-```python
-import asyncio
-import logging
-
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from pathlib import Path
-
-from vad import TurnDetector
-from stt import transcribe
-from llm import stream_reply
-from tts import synthesize
-from session import InterviewSession
-from config import SAMPLE_RATE_IN, VAD_SILENCE_MS
 ```
-- Imports FastAPI WebSocket primitives and async libraries.
-- Imports custom modules for VAD, STT, LLM, TTS, and session management.
-
-```python
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("interview")
-
-app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
+Browser                              FastAPI (server.py)
+  │                                        │
+  │  1. User fills setup form              │
+  │  2. [optional] Selects PDF resume      │
+  │     → POST /upload-resume             ──► resume.py: pdfplumber extracts text
+  │     ← {"resume_text": "..."}          │
+  │                                        │
+  │  3. Click "Begin Interview"            │
+  │     → WebSocket connect ws://…/ws/interview
+  │     → send JSON setup msg  ───────────► set_profile(setup_msg)
+  │                                        ├─ create_interview_record() → SQLite
+  │                                        └─ session.save() → Redis
+  │                                        │
+  │  4. Mic audio streams as binary PCM   │
+  │     → send bytes continuously ────────► session.audio_buffer.extend(data)
+  │                                        │  TurnDetector.process(data)
+  │                                        │    Silero VAD: speech prob per 512-sample window
+  │                                        │    When speech_started + silence ≥ 1000ms → True
+  │                                        │
+  │                                        ├─ transcribe(audio_bytes) → faster-whisper
+  │     ← {"type":"transcript","text":"…"} │    RMS + duration gate first (skip noise)
+  │                                        │    Hallucination filter (removes "thanks" etc.)
+  │                                        │
+  │                                        ├─ session.add_user_turn(text)
+  │                                        ├─ session.save() → Redis
+  │                                        ├─ save_message(id,"user",text) → SQLite
+  │                                        │
+  │                                        ├─ stream_reply(history, profile) → Groq API
+  │                                        │    Streams tokens; buffers until sentence-ending
+  │                                        │    punctuation (.?!) then synthesizes each sentence
+  │     ← binary PCM (sentence 1)         │
+  │     ← binary PCM (sentence 2) …       │  synthesize(sentence) → Kokoro TTS
+  │     ← {"type":"reply_complete","…"}   │
+  │                                        ├─ session.add_assistant_turn(full_reply)
+  │                                        ├─ session.save() → Redis
+  │                                        └─ save_message(id,"assistant",reply) → SQLite
+  │                                        │
+  │  5. "End Interview & Get Summary"      │
+  │     → send {"type":"end_interview"}   ──► generate_summary(session)
+  │                                        │    Formats transcript → Groq JSON mode
+  │     ← {"type":"summary","data":{…}}   │    openai/gpt-oss-20b returns structured JSON
+  │                                        ├─ save_summary(id, json_str) → SQLite
+  │                                        └─ session.clear() → deletes Redis keys
 ```
-- Sets up standard logging for tracking connection states and turn events.
-- Initializes the FastAPI app with CORS middleware to allow cross-origin requests during development.
-- Resolves the absolute path to the `frontend` directory for static file serving.
-
-```python
-@app.websocket("/ws/interview")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    log.info("WebSocket connected")
-    session = InterviewSession()
-    detector = TurnDetector(sample_rate=SAMPLE_RATE_IN, silence_ms=VAD_SILENCE_MS)
-```
-- Handles incoming WebSocket upgrade requests at `/ws/interview`.
-- Instantiates a fresh `InterviewSession` (isolated history and buffer) and `TurnDetector` per client connection.
-
-```python
-    try:
-        while True:
-            data = await websocket.receive_bytes()
-            session.audio_buffer.extend(data)
-
-            if detector.process(data):
-                log.info("End-of-turn detected, transcribing %d bytes...", len(session.audio_buffer))
-
-                audio_bytes = bytes(session.audio_buffer)
-                session.audio_buffer.clear()
-                user_text = await asyncio.to_thread(transcribe, audio_bytes)
-```
-- `websocket.receive_bytes()` awaits incoming binary PCM16 audio chunks sent from the client.
-- Appends incoming raw bytes into the session's temporary audio buffer.
-- `detector.process(data)` returns `True` only when a complete utterance followed by the requisite silence period is detected.
-- Extracts `audio_bytes` and clears the buffer immediately to prepare for the next turn.
-- `asyncio.to_thread(transcribe, audio_bytes)` executes CPU-heavy Whisper transcription on a background worker thread, ensuring the async event loop remains responsive.
-
-```python
-                if not user_text.strip():
-                    continue
-
-                session.add_user_turn(user_text)
-                await websocket.send_json({"type": "transcript", "text": user_text})
-
-                full_reply = ""
-                sentence_buffer = ""
-
-                async for token in stream_reply(session.history):
-                    full_reply += token
-                    sentence_buffer += token
-
-                    if any(p in token for p in ".?!"):
-                        pcm = await asyncio.to_thread(synthesize, sentence_buffer)
-                        await websocket.send_bytes(pcm)
-                        sentence_buffer = ""
-
-                if sentence_buffer.strip():
-                    pcm = await asyncio.to_thread(synthesize, sentence_buffer)
-                    await websocket.send_bytes(pcm)
-
-                session.add_assistant_turn(full_reply)
-                await websocket.send_json({"type": "reply_complete", "text": full_reply})
-                log.info("Reply sent: %s", full_reply[:80])
-
-                detector.reset()
-                session.audio_buffer.clear()
-```
-- If transcription yields non-empty text, it registers the user turn in dialogue history and sends a JSON transcript message to the frontend.
-- Iterates over tokens yielded by `stream_reply(session.history)` asynchronously.
-- Accumulates tokens in `sentence_buffer`. When punctuation (`.`, `?`, `!`) is detected, it runs `synthesize` in a background thread and immediately streams the binary PCM audio bytes downstream over WebSocket.
-- After the token stream completes, any trailing sentence fragment is synthesized and dispatched.
-- Records the complete assistant turn in session history and dispatches a `reply_complete` JSON payload.
-- Resets the `TurnDetector` internal state and clears any remnant audio buffer.
-
-```python
-    except WebSocketDisconnect:
-        log.info("WebSocket disconnected")
-    except Exception as e:
-        log.exception("Error in websocket handler: %s", e)
-
-app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
-```
-- Gracefully handles client disconnections and unexpected exceptions.
-- Mounts static files at the root route `/` so the frontend UI is served directly from the same origin. Note: the mount is declared after the WebSocket route to prevent route interception.
 
 ---
 
-### `backend/vad.py`
+## File-by-File Deep Dive
 
-#### Purpose
-Implements voice activity detection using Google's `webrtcvad` engine, converting arbitrary streaming chunk sizes into strict 30 ms frame evaluations.
+### `config.py`
 
-#### Detailed Code Explanation
+Single source of truth for all configuration. Everything reads from `.env` via `python-dotenv`.
 
-```python
-import webrtcvad
-
-
-class TurnDetector:
-    def __init__(self, aggressiveness=2, sample_rate=16000, silence_ms=700):
-        self.vad = webrtcvad.Vad(aggressiveness)
-        self.sample_rate = sample_rate
-        self.frame_ms = 30
-        self.frame_bytes = int(sample_rate * self.frame_ms / 1000) * 2
-        self.silence_frames_needed = silence_ms // self.frame_ms
-        self.silence_count = 0
-        self.speech_started = False
-        self._buffer = bytearray()
-```
-- `webrtcvad.Vad(aggressiveness)`: Aggressiveness mode ranges from 0 (least aggressive about filtering non-speech) to 3 (most aggressive). Mode 2 provides an optimal balance between sensitivity to voice and rejection of background noise.
-- `frame_bytes`: At 16,000 Hz, 30 ms corresponds to `(16000 * 30 / 1000) = 480` samples. Since each sample is a 16-bit signed integer (2 bytes), each frame is exactly `480 * 2 = 960` bytes.
-- `silence_frames_needed`: For 700 ms silence, `700 // 30 = 23` consecutive silent frames must occur after speech to confirm turn completion.
-- `_buffer`: Internal byte accumulator across multiple small incoming WebSocket packets.
-
-```python
-    def process(self, pcm_bytes: bytes) -> bool:
-        self._buffer.extend(pcm_bytes)
-
-        while len(self._buffer) >= self.frame_bytes:
-            frame = bytes(self._buffer[:self.frame_bytes])
-            self._buffer = self._buffer[self.frame_bytes:]
-
-            is_speech = self.vad.is_speech(frame, self.sample_rate)
-
-            if is_speech:
-                self.speech_started = True
-                self.silence_count = 0
-            elif self.speech_started:
-                self.silence_count += 1
-                if self.silence_count >= self.silence_frames_needed:
-                    self.reset()
-                    return True
-        return False
-
-    def reset(self):
-        self.speech_started = False
-        self.silence_count = 0
-        self._buffer.clear()
-```
-- `process(pcm_bytes)`: Appends incoming bytes to `_buffer`. Loops while there are at least 960 bytes, slices off exact 30 ms frames, and tests with `vad.is_speech(frame, sample_rate)`.
-- If speech is detected, `speech_started` is set to `True` and `silence_count` is reset to 0.
-- If speech has previously begun and current frame is non-speech, `silence_count` increments.
-- When `silence_count >= silence_frames_needed`, turn end is triggered, internal state is reset, and `True` is returned.
-
----
-
-### `backend/stt.py`
-
-#### Purpose
-Speech-to-text inference wrapper around `faster-whisper` (CTranslate2 implementation) with multi-stage hallucination guards.
-
-#### Detailed Code Explanation
-
-```python
-from faster_whisper import WhisperModel
-import numpy as np
-from config import WHISPER_MODEL_SIZE, WHISPER_DEVICE, WHISPER_COMPUTE_TYPE, SAMPLE_RATE_IN
-
-whispermodel = WhisperModel(WHISPER_MODEL_SIZE, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE)
-
-MIN_RMS_THRESHOLD = 0.01
-MIN_DURATION_SEC = 0.5
-
-HALLUCINATIONS = {
-    "thank you", "thanks", "thank you.", "thanks.", "bye", "bye.",
-    "thanks for watching", "thanks for watching.", "thank you for watching",
-    "thank you for watching.", "you", "you.", "subscribe",
-}
-```
-- Initializes `WhisperModel` once on module import using `small.en` on CPU with `int8` quantization for efficient inference.
-- Defines validation thresholds: minimum audio duration (0.5s) and minimum Root Mean Square (RMS) signal energy (0.01).
-- Sets up a blocklist of common Whisper hallucinations that occur when running inference on low-energy or silent audio.
-
-```python
-def transcribe(pcm_bytes: bytes) -> str:
-    audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-
-    duration = len(audio) / SAMPLE_RATE_IN
-    if duration < MIN_DURATION_SEC:
-        return ""
-
-    rms = np.sqrt(np.mean(audio ** 2))
-    if rms < MIN_RMS_THRESHOLD:
-        return ""
-
-    segments, info = whispermodel.transcribe(audio, language="en", beam_size=1)
-    text = " ".join(seg.text for seg in segments).strip()
-
-    if text.lower().strip() in HALLUCINATIONS:
-        return ""
-
-    return text
-```
-- Deserializes raw PCM16 bytes into a numpy array and normalizes to `[-1.0, 1.0]` float range by dividing by 32768.0.
-- **Gate 1 (Duration)**: Rejects very short audio bursts (< 0.5s).
-- **Gate 2 (RMS Energy)**: Computes root mean square of signal `sqrt(mean(x^2))`. Rejects near-silent background noise.
-- Transcribes using greedy search (`beam_size=1`) for minimum latency.
-- **Gate 3 (Hallucination Blocklist)**: Filters out spurious subtitle hallucinations.
-
----
-
-### `backend/llm.py`
-
-#### Purpose
-Asynchronous integration with Groq Cloud LLM API for low-latency streaming completions.
-
-#### Detailed Code Explanation
-
-```python
-from groq import AsyncGroq
-from config import GROQ_API_KEY, GROQ_MODEL
-
-client = AsyncGroq(api_key=GROQ_API_KEY)
-
-SystemPrompt = "You are an interview coach conducting a technical mock interview. Ask one question at a time, listen to the answer, give brief feedback, then ask a natural follow-up. Keep responses under 3 sentences."
-
-
-async def stream_reply(history: list[dict]):
-    stream = await client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[{"role": "system", "content": SystemPrompt}] + history,
-        stream=True
-    )
-    async for chunk in stream:
-        token = chunk.choices[0].delta.content or ""
-        if token:
-            yield token
-```
-- Instantiates `AsyncGroq` client.
-- Prepends `SystemPrompt` with instructions to conduct structured, concise technical interviews (under 3 sentences per turn).
-- Sends full dialogue `history` (`[{"role": "user", "content": ...}, {"role": "assistant", "content": ...}]`) to maintain conversational context.
-- Uses `stream=True` to yield individual tokens asynchronously as they are generated by the model.
-
----
-
-### `backend/tts.py`
-
-#### Purpose
-Text-to-speech synthesis utilizing the lightweight Kokoro-82M pipeline.
-
-#### Detailed Code Explanation
-
-```python
-from kokoro import KPipeline
-import numpy as np
-from config import KOKORO_LANG_CODE, KOKORO_VOICE, SAMPLE_RATE_OUT as SAMPLE_RATE
-
-pipeline = KPipeline(lang_code=KOKORO_LANG_CODE)
-
-def synthesize(text: str) -> bytes:
-    audio_chunks = []
-    for _, _, audio in pipeline(text, voice=KOKORO_VOICE):
-        audio_chunks.append(audio)
-    full_audio = np.concatenate(audio_chunks)
-    return (full_audio * 32767).astype(np.int16).tobytes()
-```
-- Initializes `KPipeline` with American English (`lang_code="a"`).
-- Iterates over generated audio chunks for the given text segment using voice `af_heart`.
-- Concatenates audio segments into a single numpy float array.
-- Multiplies float samples `[-1.0, 1.0]` by 32767 to quantize into 16-bit signed integer PCM (`int16`), converts to raw bytes, and returns the payload for WebSocket transmission.
-
----
-
-### `backend/session.py`
-
-#### Purpose
-Lightweight in-memory session container managing turn history and audio accumulation.
-
-```python
-class InterviewSession:
-    def __init__(self, session_id: str = "default"):
-        self.audio_buffer = bytearray()
-        self.history: list[dict] = []
-        self.session_id = session_id
-
-    def add_user_turn(self, text: str):
-        self.history.append({"role": "user", "content": text})
-
-    def add_assistant_turn(self, text: str):
-        self.history.append({"role": "assistant", "content": text})
-```
-- `audio_buffer`: A mutable `bytearray` accumulating raw PCM16 bytes until the VAD signals end-of-turn.
-- `history`: List of role-content message dictionaries maintaining turn history for multi-turn LLM reasoning.
-
----
-
-### `backend/config.py`
-
-#### Purpose
-Centralized configuration repository loading environment variables and setting constants.
-
-```python
-import os
-from dotenv import load_dotenv
-
-load_dotenv()
-
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL")
-
-WHISPER_MODEL_SIZE = "small.en"
-WHISPER_DEVICE = "cpu"
-WHISPER_COMPUTE_TYPE = "int8"
-
-KOKORO_LANG_CODE = "a"
-KOKORO_VOICE = "af_heart"
-
-SAMPLE_RATE_IN = 16000
-SAMPLE_RATE_OUT = 24000
-
-VAD_SILENCE_MS = 700
-```
-- Loads environment variables from `.env`.
-- Configures sample rates: 16 kHz for input capture (standard for Whisper and WebRTC VAD), 24 kHz for output synthesis (Kokoro native output).
-- Sets VAD silence threshold to 700 ms.
-
----
-
-## 3. Frontend Deep-Dive
-
-### `frontend/index.html`
-
-#### Purpose
-Single-page application layout providing semantic structure, accessibility landmarks, the agent orb interface, audio visualization containers, and transcript feed.
-
-#### Key Structural Elements
-- `.orb-wrapper`: The interactive interactive button element (`role="button"`, `tabindex="0"`) containing the central animated orb.
-- `.ripple-ring`: Three concentric absolute-positioned circular divs that trigger CSS expansion animations when the assistant is speaking.
-- `.audio-bars`: Container populated with 48 dynamically created radial equalizer bars.
-- `.processing-spinner`: Rotating border ring active during the `processing` state.
-- `.orb`: Main visual element with gradient styling, glassmorphism backdrop blur, and SVG microphone icon.
-- `.status-area`: Two-tier status display showing primary state ("Listening...", "Thinking...", "Speaking...") and secondary guidance hint.
-- `.transcript-panel`: Scrollable glassmorphism container displaying user and coach dialogue history.
-- `.connection-status`: Fixed badge displaying WebSocket connection state.
-
----
-
-### `frontend/style.css`
-
-#### Purpose
-CSS design system implementing modern visual aesthetics (dark mode, glassmorphism, glowing gradients, keyframe animations).
-
-#### Core Design Elements
-- **Color Palette & Tokens**: Uses CSS custom properties (`--bg-primary`, `--accent-cyan`, `--accent-violet`, `--accent-emerald`, `--accent-rose`).
-- **Ambient Canvas**: Fixed pseudo-element `body::before` with rotating radial gradients simulating subtle organic movement.
-- **Radial Equalizer**: `.audio-bar` elements with `transform-origin: bottom center` arranged circularly around the orb, dynamically modulated in height via JavaScript.
-- **State-Driven Styles**:
-  - `.state-listening`: Orb glows with active cyan shadow; audio bars become visible.
-  - `.state-processing`: `.processing-spinner` activates with 360-degree rotation animation.
-  - `.state-speaking`: `.ripple-ring` elements execute staggered `rippleExpand` keyframe animations radiating outward.
-  - `.state-idle`: Gentle scale pulsing (`orbIdle`).
-
----
-
-### `frontend/pcm-worklet.js`
-
-#### Purpose
-An `AudioWorkletProcessor` running on the Web Audio audio-rendering thread to perform high-frequency format conversion without blocking the browser UI thread.
-
-#### Detailed Code Explanation
-
-```javascript
-class PCMProcessor extends AudioWorkletProcessor {
-  process(inputs) {
-    const input = inputs[0][0];
-    if (input) {
-      const int16 = new Int16Array(input.length);
-      for (let i = 0; i < input.length; i++) {
-        int16[i] = Math.max(-32768, Math.min(32767, input[i] * 32768));
-      }
-      this.port.postMessage(int16.buffer, [int16.buffer]);
-    }
-    return true;
-  }
-}
-registerProcessor("pcm-processor", PCMProcessor);
-```
-- `inputs[0][0]`: Accesses channel 0 of the first audio input buffer (128 samples of 32-bit floating point numbers between -1.0 and +1.0).
-- Quantization: Clamps values and multiplies by 32768 to convert to signed 16-bit integer values (`-32768` to `+32767`).
-- Zero-Copy Transfer: `this.port.postMessage(int16.buffer, [int16.buffer])` transfers ownership of the underlying `ArrayBuffer` to the main thread without memory allocation copying.
-- Returns `true` to keep the processor alive for subsequent frames.
-
----
-
-### `frontend/main.js`
-
-#### Purpose
-Coordinates application state, Web Audio capture and playback, frequency domain FFT analysis, WebSocket networking, and DOM rendering.
-
-#### Detailed Code Explanation
-
-```javascript
-const appContainer = document.getElementById('appContainer');
-const orbWrapper = document.getElementById('orbWrapper');
-const audioBarsEl = document.getElementById('audioBars');
-const statusText = document.getElementById('statusText');
-const statusHint = document.getElementById('statusHint');
-const transcriptPanel = document.getElementById('transcriptPanel');
-const transcriptEmpty = document.getElementById('transcriptEmpty');
-const connectionDot = document.getElementById('connectionDot');
-const connectionLabel = document.getElementById('connectionLabel');
-
-let appState = 'idle';
-let ws = null;
-let audioCtx = null;
-let micStream = null;
-let analyserNode = null;
-let workletNode = null;
-let playbackQueueTime = 0;
-let animFrameId = null;
-
-const NUM_BARS = 48;
-const BAR_RADIUS = 120;
-```
-- References all required DOM elements and initializes application state variables.
-- Configures 48 radial audio bars positioned at a radius of 120 px from the orb center.
-
-```javascript
-(function createAudioBars() {
-  for (let i = 0; i < NUM_BARS; i++) {
-    const bar = document.createElement('div');
-    bar.className = 'audio-bar';
-    const angle = (i / NUM_BARS) * 360;
-    const rad = (angle * Math.PI) / 180;
-    const x = Math.cos(rad) * BAR_RADIUS;
-    const y = Math.sin(rad) * BAR_RADIUS;
-    bar.style.left = `calc(50% + ${x}px - 1.5px)`;
-    bar.style.top = `calc(50% + ${y}px)`;
-    bar.style.height = '4px';
-    bar.style.transform = `rotate(${angle + 90}deg)`;
-    audioBarsEl.appendChild(bar);
-  }
-})();
-
-const audioBars = audioBarsEl.querySelectorAll('.audio-bar');
-```
-- Trigonometrically computes `(x, y)` coordinates around a circle for each bar and rotates it outwards.
-
-```javascript
-function setState(newState) {
-  appState = newState;
-  appContainer.classList.remove('state-idle', 'state-listening', 'state-processing', 'state-speaking');
-  appContainer.classList.add(`state-${newState}`);
-  // Updates UI text accordingly
-}
-```
-- Transitions application state and applies CSS classes to activate visual animations.
-
-```javascript
-function connectWebSocket() {
-  ws = new WebSocket('ws://localhost:8001/ws/interview');
-  ws.binaryType = 'arraybuffer';
-  // Handles onopen, onclose, onerror, onmessage
-}
-
-function handleJsonMessage(msg) {
-  if (msg.type === 'transcript') {
-    addTranscriptEntry('You', msg.text, 'user');
-    setState('processing');
-  } else if (msg.type === 'reply_complete') {
-    addTranscriptEntry('Coach', msg.text, 'ai');
-    const delayMs = Math.max(0, (playbackQueueTime - audioCtx.currentTime) * 1000) + 300;
-    setTimeout(() => {
-      if (appState === 'speaking') {
-        setState('listening');
-      }
-    }, delayMs);
-  }
-}
-
-function handleAudioMessage(arrayBuffer) {
-  setState('speaking');
-  playPCM(arrayBuffer);
-}
-```
-- Handles binary and JSON WebSocket payloads.
-- Calculates remaining playback time based on `playbackQueueTime - audioCtx.currentTime` to transition state back to `listening` exactly when audio completes.
-
-```javascript
-function playPCM(arrayBuffer) {
-  if (!audioCtx) return;
-
-  const int16 = new Int16Array(arrayBuffer);
-  const float32 = Float32Array.from(int16, x => x / 32768);
-
-  const buffer = audioCtx.createBuffer(1, float32.length, 24000);
-  buffer.copyToChannel(float32, 0);
-
-  const src = audioCtx.createBufferSource();
-  src.buffer = buffer;
-  src.connect(audioCtx.destination);
-
-  const startAt = Math.max(audioCtx.currentTime, playbackQueueTime);
-  src.start(startAt);
-  playbackQueueTime = startAt + buffer.duration;
-}
-```
-- Deserializes binary 16-bit PCM back to normalized float32.
-- Creates an `AudioBuffer` at 24,000 Hz.
-- Schedules playback start time to `Math.max(currentTime, playbackQueueTime)` to ensure seamless, gapless playback of incoming audio chunks.
-
-```javascript
-async function startMicrophone() {
-  audioCtx = new AudioContext({ sampleRate: 16000 });
-  micStream = await navigator.mediaDevices.getUserMedia({
-    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-  });
-
-  const source = audioCtx.createMediaStreamSource(micStream);
-
-  analyserNode = audioCtx.createAnalyser();
-  analyserNode.fftSize = 256;
-  analyserNode.smoothingTimeConstant = 0.7;
-  source.connect(analyserNode);
-
-  await audioCtx.audioWorklet.addModule('pcm-worklet.js');
-  workletNode = new AudioWorkletNode(audioCtx, 'pcm-processor');
-
-  workletNode.port.onmessage = (e) => {
-    if (ws && ws.readyState === WebSocket.OPEN && appState === 'listening') {
-      ws.send(e.data);
-    }
-  };
-
-  source.connect(workletNode);
-  startVisualization();
-}
-```
-- Initializes microphone with browser-level DSP (echo cancellation, noise suppression).
-- Connects audio graph: `Source -> AnalyserNode` and `Source -> AudioWorkletNode`.
-- **Feedback Prevention Gate**: Microphone bytes are sent via WebSocket **only** when `appState === 'listening'`.
-
----
-
-## 4. Audio DSP & Pipeline Mechanics
-
-### Linear PCM16 Representation
-- Uncompressed raw audio representation.
-- Each sample is represented as a signed 16-bit integer spanning `[-32768, +32767]`.
-- Little-Endian byte ordering is standard across x86 and ARM architectures.
-
-### Sample Rates: 16 kHz vs 24 kHz
-- **16,000 Hz (Capture & STT)**: 16 kHz is the standard for human speech recognition (Nyquist frequency 8 kHz covers all intelligible human vocal formants). It reduces bandwidth and computational load on `webrtcvad` and Whisper.
-- **24,000 Hz (TTS Playback)**: Kokoro-82M outputs audio at 24 kHz for richer acoustic fidelity and higher voice clarity.
-
-### Fast Fourier Transform (FFT) Visualization
-- The `AnalyserNode` computes real-time frequency domain data (`getByteFrequencyData`) with an FFT size of 256 (giving 128 frequency bins).
-- The 48 radial bars sample these bins across low, mid, and high vocal frequencies to drive smooth physical visualizations.
-
----
-
-## 5. Concurrency & Non-Blocking Design
-
-### Python Asyncio Event Loop & CPU-Bound Operations
-In Python's `asyncio`, blocking synchronous operations (such as running CTranslate2 matrix computations in Whisper or PyTorch inference in Kokoro) would freeze the event loop. This causes:
-- WebSocket ping/pong timeouts.
-- Missed network packets.
-- Stalled streaming pipelines.
-
-### Thread Pool Offloading
-The codebase utilizes `asyncio.to_thread()`:
-```python
-user_text = await asyncio.to_thread(transcribe, audio_bytes)
-pcm = await asyncio.to_thread(synthesize, sentence_buffer)
-```
-This offloads the synchronous blocking call to a thread pool executor, allowing the main event loop to continue servicing network I/O, WebSockets, and client signals.
-
----
-
-## 6. Key Engineering Challenges & Solutions
-
-| Problem | Root Cause | Implemented Solution |
+| Variable | Default | What it controls |
 |---|---|---|
-| **Audio Feedback Loop** | Mic picked up assistant voice from speakers during playback, triggering VAD and echoing back to Whisper. | 1. Client-side gating: Mic only streams when `appState === 'listening'`.<br>2. Explicit VAD reset on turn transition. |
-| **Whisper Silence Hallucination** | Whisper generates false transcripts (e.g., "Thank you") on silent audio buffers. | 1. Duration check (> 0.5s).<br>2. RMS energy threshold (> 0.01).<br>3. Common hallucination blocklist filter. |
-| **VAD Frame Mismatch** | AudioWorklet produces 128-sample chunks (256 bytes), but `webrtcvad` requires exact 30 ms frames (960 bytes). | Added internal `bytearray` buffer in `TurnDetector` that accumulates chunks and extracts exact 960-byte slices. |
-| **High Response Latency** | Waiting for complete LLM generation before starting TTS causes multi-second user delays. | Punctuation-based sentence streaming: TTS synthesizes sentences incrementally as tokens stream from Groq. |
-| **Audio Choppiness on Playback** | Receiving audio in disparate network chunks causes audio gaps. | Timeline scheduling in Web Audio API using `playbackQueueTime` offset tracking. |
+| `GROQ_API_KEY` | — | Groq API authentication |
+| `GROQ_MODEL` | set in `.env` → `qwen/qwen3.6-27b` | Main interview model (reasoning) |
+| `GROQ_SUMMARY_MODEL` | `openai/gpt-oss-20b` | Summary-only model (non-reasoning, JSON mode) |
+| `WHISPER_MODEL_SIZE` | `small.en` | Whisper model variant (speed vs accuracy) |
+| `WHISPER_DEVICE` | `cpu` | `cpu` or `cuda` |
+| `WHISPER_COMPUTE_TYPE` | `int8` | Quantization for CPU inference |
+| `KOKORO_LANG_CODE` | `a` | American English |
+| `KOKORO_VOICE` | `af_heart` | Voice persona |
+| `SAMPLE_RATE_IN` | `16000` | Mic capture rate (Hz) — must match Whisper |
+| `SAMPLE_RATE_OUT` | `24000` | TTS output rate (Hz) — must match Kokoro |
+| `VAD_SILENCE_MS` | `1000` | How long silence must persist to end a turn |
+| `VAD_THRESHOLD` | `0.5` | Silero speech probability cutoff (0–1) |
 
 ---
 
-## 7. Technical Interview Questions & Answers
+### `server.py`
 
-### Q1: How does Voice Activity Detection (VAD) work in this system?
-**Answer**: We use Google's `webrtcvad`, which analyzes the spectral energy and acoustic characteristics of 30 ms audio frames (960 bytes at 16 kHz) to classify them as speech or non-speech. Because the browser AudioWorklet sends smaller chunks (256 bytes), we maintain an internal byte buffer in `TurnDetector`. Once speech starts, the system tracks consecutive silence frames. When 700 ms of silence (23 consecutive 30 ms frames) is detected, it signals that the user has completed their turn.
+FastAPI application. Three responsibilities:
 
-### Q2: Why use WebSockets instead of HTTP POST / REST endpoints for voice streaming?
-**Answer**: WebSockets provide a persistent, bidirectional, full-duplex TCP connection with minimal framing overhead. In a voice agent, we require low latency: streaming raw PCM audio chunks upstream continuously, receiving streamed tokens, and streaming synthesized PCM audio chunks downstream simultaneously. HTTP request/response overhead and connection establishment latency would add hundreds of milliseconds of turn-taking delay.
+**1. App setup**
+- `lifespan` async context manager: calls `init_db()` before the server accepts requests, creating SQLite tables if they don't exist.
+- `CORSMiddleware` with `allow_origins=["*"]` — open for local dev, lock down for prod.
+- Mounts the `frontend/` directory as static files at `/` so the browser can load the UI.
+- Includes the `resume_router` (`POST /upload-resume`).
 
-### Q3: How do you achieve low Time-to-First-Audio (TTFA) latency?
-**Answer**: We implement a multi-stage streaming pipeline:
-1. Fast local VAD detection with a 700 ms silence boundary.
-2. Fast STT inference using `faster-whisper` (CTranslate2 `int8` quantization).
-3. Streaming LLM inference via Groq API.
-4. Sentence-level TTS chunking: rather than waiting for the entire LLM response, the first sentence is dispatched to Kokoro TTS as soon as punctuation (`.`, `?`, `!`) is reached.
-5. Immediate binary streaming of audio bytes to the client for scheduled playback.
+**2. REST endpoint: `GET /history/{candidate_name}`**
+- Calls `get_user_interview_history(name)` and returns JSON.
+- Used to retrieve a candidate's past interview records.
 
-### Q4: How is audio format conversion handled between client and server?
-**Answer**:
-- **Capture**: The browser microphone captures `Float32` samples at 16 kHz. An `AudioWorkletProcessor` quantizes these into signed 16-bit integers (`Int16Array`) and transfers the raw `ArrayBuffer` over WebSocket.
-- **Server Processing**: STT processes 16 kHz PCM16 bytes.
-- **Synthesis**: Kokoro TTS synthesizes audio at 24 kHz float, which is converted to signed 16-bit PCM bytes.
-- **Playback**: The client deserializes the 24 kHz PCM16 bytes back into a `Float32Array`, loads it into an `AudioBuffer` at 24,000 Hz, and connects it to the audio destination.
+**3. WebSocket endpoint: `/ws/interview`**
+- Each connection gets a fresh `uuid.uuid4()` as `interview_id` — this is both the Redis session key and the SQL primary key.
+- Receives the setup JSON first (name, role, company, tech_stack, resume_text).
+- Then enters an event loop that handles two message types:
+  - **Text** (`msg["text"]`): currently only `{"type": "end_interview"}` — triggers summary generation, DB save, Redis clear.
+  - **Binary** (`msg["bytes"]`): raw 16-bit PCM audio chunks from the browser mic.
+- All DB calls (`create_interview_record`, `save_message`, `save_summary`) are wrapped in `try/except` so a DB failure never aborts an active session.
 
-### Q5: How do you prevent blocking the Python asyncio event loop with deep learning models?
-**Answer**: Python's `asyncio` is single-threaded. CPU-heavy model inferences (Whisper and Kokoro) are synchronous C-extensions. If called directly inside an async function, they block the entire process, preventing WebSocket frames from being sent or received. We wrap these synchronous calls in `await asyncio.to_thread(...)`, which delegates execution to Python's default `ThreadPoolExecutor` and yields control back to the event loop.
+---
+
+### `session.py`
+
+`InterviewSession` holds the live state of one interview:
+
+| Attribute | Type | Purpose |
+|---|---|---|
+| `session_id` | `str` | UUID from server.py — used as Redis key prefix |
+| `profile` | `dict` | Candidate info (name, role, company, tech_stack, resume_text) |
+| `history` | `list[dict]` | Conversation turns: `[{"role": "user"/"assistant", "content": "..."}]` |
+| `audio_buffer` | `bytearray` | Accumulates raw mic PCM between VAD turns |
+
+**Redis methods:**
+- `save()` — pipeline-writes `history` + `profile` as JSON strings with a 24h TTL. Called after every completed turn (both user and assistant sides).
+- `load()` — restores state from Redis on reconnect (returns `True` if data found).
+- `clear()` — deletes both Redis keys after a completed interview (SQL has the permanent copy).
+
+Redis keys: `interview:{session_id}:history` and `interview:{session_id}:profile`
+
+Env vars: `REDIS_URL` (default `redis://localhost:6379`), `REDIS_SESSION_TTL_S` (default 86400).
+
+---
+
+### `database.py`
+
+Async SQLAlchemy ORM for permanent interview history.
+
+**Engine**: reads `DATABASE_URL` env var (default: `sqlite+aiosqlite:///./interviews.db`). To switch to Postgres: `DATABASE_URL=postgresql+asyncpg://user:pass@host/db`.
+
+**Tables:**
+
+`interview_records`
+| Column | Type | Notes |
+|---|---|---|
+| `id` | TEXT PK | UUID string from server.py |
+| `candidate_name` | TEXT | Indexed for history lookup |
+| `target_role` | TEXT | |
+| `company` | TEXT | Nullable |
+| `created_at` | DATETIME TZ | UTC |
+| `summary_json` | TEXT | NULL until interview ends; stores JSON string |
+
+`message_records`
+| Column | Type | Notes |
+|---|---|---|
+| `id` | INT PK | Autoincrement |
+| `interview_id` | TEXT FK | References `interview_records.id`, CASCADE delete |
+| `role` | TEXT | `"user"` or `"assistant"` |
+| `content` | TEXT | Full turn text |
+| `created_at` | DATETIME TZ | UTC |
+
+**CRUD functions:**
+- `init_db()` — creates all tables if missing. Called on startup.
+- `create_interview_record(id, profile)` — inserts one row into `interview_records`.
+- `save_message(id, role, content)` — inserts one row into `message_records`.
+- `save_summary(id, json_str)` — updates `summary_json` on the record.
+- `get_user_interview_history(name)` — SELECT WHERE candidate_name = name ORDER BY created_at DESC. Returns list of dicts with parsed summary and message_count.
+
+---
+
+### `llm.py`
+
+Three functions, two Groq models.
+
+**`SystemPrompt(profile)`**
+Builds the system prompt string. If `profile["resume_text"]` is present, it appends a fenced resume block instructing the model to reference actual projects. The prompt tells the LLM to: ask one question at a time, build follow-ups from previous answers, give brief feedback, keep responses under 3 sentences.
+
+**`stream_reply(history, profile)`** — async generator
+- Sends `[system prompt] + history` to `GROQ_MODEL` (`qwen/qwen3.6-27b`).
+- `reasoning_format="hidden"` suppresses Qwen3's internal chain-of-thought from appearing in the output.
+- Yields tokens as they stream in.
+- In `server.py`, tokens are buffered until punctuation (`.?!`), then each sentence is TTS-synthesized and sent as PCM.
+
+**`generate_summary(session)`**
+- Formats the full history into `Candidate: …\nInterviewer: …` lines.
+- Sends a structured JSON request to `SUMMARY_MODEL` (`openai/gpt-oss-20b`) with `response_format={"type": "json_object"}`.
+- Parses and returns the JSON dict with keys: `overall_impression`, `strengths`, `areas_to_improve`, `communication_notes`, `suggested_next_steps`.
+- Falls back to stripping markdown code fences if the model wraps JSON in backticks.
+
+**Why two models?** `qwen/qwen3.6-27b` is a reasoning model — great for natural conversation but unreliable with `json_object` response format. `openai/gpt-oss-20b` is a standard instruction-following model that reliably returns clean JSON.
+
+---
+
+### `stt.py` — Speech-to-Text
+
+Uses `faster-whisper` (CTranslate2 port of OpenAI Whisper) running locally on CPU.
+
+`transcribe(pcm_bytes, context_terms)`:
+1. Converts raw int16 PCM → float32 normalized audio.
+2. **Duration gate**: skips if audio < 0.5s (avoids wasting inference on tiny fragments).
+3. **RMS gate**: skips if audio is too quiet (RMS < 0.01), which catches silence/noise.
+4. Builds an optional `initial_prompt` from `context_terms` (candidate name, company, tech stack) to bias Whisper toward recognizing domain-specific words correctly.
+5. Runs `whispermodel.transcribe()` with English language and beam_size=5.
+6. **Hallucination filter**: Whisper sometimes outputs "thank you" or "thanks for watching" for silence — these are explicitly filtered out.
+
+---
+
+### `tts.py` — Text-to-Speech
+
+Uses `Kokoro` (a fast local TTS model) running on CPU.
+
+`synthesize(text)`:
+1. Runs the Kokoro pipeline on the input text, iterating over audio chunks.
+2. Concatenates all chunks into a single numpy float32 array.
+3. Converts to int16 PCM and returns raw bytes.
+
+Output is sent over the WebSocket as binary frames. The browser's `AudioContext` queues them for gapless playback using `playbackQueueTime` to schedule each buffer exactly where the previous one ends.
+
+---
+
+### `vad.py` — Voice Activity Detection
+
+`TurnDetector` wraps the Silero VAD model to detect when a speaker has finished their turn.
+
+**How it works:**
+1. Accumulates incoming PCM in a `bytearray` buffer.
+2. Processes in 512-sample windows (32ms at 16kHz).
+3. For each window, runs Silero VAD inference to get a speech probability (0–1).
+4. State machine:
+   - If `prob >= threshold` (0.5): marks `speech_started = True`, resets silence counter.
+   - If `speech_started` and `prob < threshold`: increments `silence_sample_count`.
+   - When `silence_sample_count >= silence_samples_needed` (16000 samples = 1 second): returns `True` (end of turn) and calls `reset()`.
+5. `reset()` clears the buffer and calls `model.reset_states()` to reset Silero's internal GRU state.
+
+---
+
+### `routers/resume.py`
+
+`POST /upload-resume` — single endpoint, no auth required.
+
+1. `_validate_pdf()`: checks filename ends in `.pdf` AND `content_type` is `application/pdf` or `application/x-pdf`. Returns 400 otherwise.
+2. Reads the full file bytes.
+3. Opens with `pdfplumber`, iterates pages, extracts text per page.
+4. Stops early once 4000 chars are accumulated (no need to process a 200-page PDF).
+5. Joins page texts with `\n`, strips, checks it's non-empty → 422 if empty (scanned/image PDF).
+6. Truncates to 4000 chars and returns `{"resume_text": "..."}`.
+
+---
+
+## Frontend Architecture
+
+### `pcm-worklet.js`
+
+AudioWorklet processor that runs in a dedicated audio thread. Receives 128-sample float32 frames from the mic → converts to int16 → posts to the main thread via `port.postMessage`. The main thread (main.js) forwards these over the WebSocket as binary frames.
+
+### `main.js` — Application State Machine
+
+States: `idle` → `listening` → `processing` → `speaking` → `listening` …
+
+**Key variables:**
+- `ws` — the active WebSocket connection
+- `audioCtx` — Web Audio API context (16kHz for capture, plays at 24kHz via buffer source)
+- `playbackQueueTime` — running timestamp for gapless TTS audio scheduling
+- `resumeText` — extracted resume text from `/upload-resume`; included in the WS setup JSON
+
+**Startup flow:**
+1. User fills form (name, role, company, tech_stack).
+2. Optionally selects a PDF → `change` event → `fetch('/upload-resume', FormData)` → stores `resumeText`.
+3. Click "Begin Interview" → `connectWebSocket(profile)` where `profile` includes `resume_text`.
+4. On WS `onopen`: sends profile JSON, hides form panel, calls `startMicrophone()`.
+
+**Audio capture:**
+- `startMicrophone()` creates an `AudioContext` at 16kHz, gets mic stream, creates `AnalyserNode` (for potential visualizations), and loads the PCM worklet.
+- The worklet's `onmessage` handler forwards int16 frames to the WS — but only when `appState === 'listening'` (prevents TTS audio feedback loop).
+
+**Audio playback:**
+- `handleAudioMessage(arrayBuffer)`: converts int16 → float32 → creates an `AudioBuffer` → schedules it starting at `playbackQueueTime` for seamless, gap-free playback of multiple sentences.
+
+**Summary modal:**
+- Opens immediately when "End Interview" is clicked (shows spinner).
+- Populates from `{"type": "summary", "data": {...}}` WS message.
+- Has a 35-second timeout fallback to show an error if summary never arrives.
+
+### `index.html`
+
+Static single-page shell. Notable sections:
+- **Setup form**: name, role (required), company (optional), tech stack, resume upload (optional).
+- **Resume upload zone**: custom `<label>` wrapping a hidden `<input type="file">`. Shows upload state via `data-upload-state` attribute driving CSS classes.
+- **Orb wrapper**: contains two `<canvas>` elements — `shader-canvas` (WebGL noise sphere) and `wave-canvas` (circular pulse rings).
+- **Transcript panel**: hidden initially, shown once session starts. Entries added by `addTranscriptEntry()`.
+- **Summary modal**: contains loading spinner, structured content sections, and an error fallback.
+- **WebGL shader** (inline `<script>`): full GLSL fragment shader with simplex noise for the animated obsidian orb. Intensity controlled by `window.setShaderIntensity(val)` — driven by app state.
+- **Wave engine** (inline `<script>`): spawns expanding ring animations from the orb, controlled by `window.setWaveActive(bool)`.
+
+---
+
+## Data Flow Summary
+
+```
+Mic → PCM worklet → WS (binary) → server.py buffer
+                                        ↓
+                                   VAD detects turn end
+                                        ↓
+                                   stt.py (Whisper)
+                                        ↓
+                                session.add_user_turn()
+                                session.save() → Redis
+                                save_message() → SQLite
+                                        ↓
+                                   llm.py stream_reply()
+                                   (Groq: qwen3.6-27b)
+                                        ↓ tokens
+                              sentence buffer → tts.py (Kokoro)
+                                        ↓ PCM bytes
+                              WS (binary) → browser playback queue
+                                        ↓
+                                session.add_assistant_turn()
+                                session.save() → Redis
+                                save_message() → SQLite
+```
+
+---
+
+## Environment Variables Reference
+
+| Variable | File read in | Default |
+|---|---|---|
+| `GROQ_API_KEY` | config.py | required |
+| `GROQ_MODEL` | config.py | required (set in .env) |
+| `GROQ_SUMMARY_MODEL` | config.py | `openai/gpt-oss-20b` |
+| `DATABASE_URL` | database.py | `sqlite+aiosqlite:///./interviews.db` |
+| `DB_ECHO` | database.py | `""` (off) |
+| `REDIS_URL` | session.py | `redis://localhost:6379` |
+| `REDIS_SESSION_TTL_S` | session.py | `86400` (24h) |
+
+---
+
+## Key Design Decisions
+
+- **Two persistence layers**: Redis for live reconnect state (fast, ephemeral), SQLite for permanent history (queryable, durable). Redis is cleared after a successful summary; SQL never is.
+- **Two LLM models**: reasoning model (Qwen3) for natural conversation, non-reasoning model (gpt-oss-20b) for reliable structured JSON output.
+- **Sentence-level TTS streaming**: the LLM streams tokens and audio is synthesized per-sentence instead of waiting for the full reply — keeps perceived latency low.
+- **DB failures don't kill sessions**: all `create_interview_record`, `save_message`, `save_summary` calls are inside `try/except` — a DB outage degrades gracefully without crashing the WebSocket handler.
+- **VAD state machine over raw silence detection**: Silero VAD is much more robust than RMS thresholding for distinguishing breathing/background noise from actual pauses between words.

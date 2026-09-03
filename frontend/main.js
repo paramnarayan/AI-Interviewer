@@ -1,11 +1,3 @@
-/* ========================================================================
-   AI Voice Interviewer — Main Application
-   ========================================================================
-   Flow: Setup form → Begin → WS connect → send profile → mic start → session
-   States: idle → listening → processing → speaking → listening …
-   ======================================================================== */
-
-// ─── DOM References ───
 const appContainer = document.getElementById('appContainer');
 const orbWrapper = document.getElementById('orbWrapper');
 const statusText = document.getElementById('statusText');
@@ -23,35 +15,35 @@ const summaryModal = document.getElementById('summaryModal');
 const summaryLoading = document.getElementById('summaryLoading');
 const summaryContent = document.getElementById('summaryContent');
 const summaryError = document.getElementById('summaryError');
+const resumeFileInput = document.getElementById('resumeFile');
+const resumeDropZone = document.getElementById('resumeDropZone');
+const resumeDropText = document.getElementById('resumeDropText');
+const resumeStatus = document.getElementById('resumeStatus');
 
-// ─── App State ───
-let appState = 'idle'; // idle | listening | processing | speaking
+let appState = 'idle';
 let ws = null;
 let audioCtx = null;
 let micStream = null;
 let analyserNode = null;
 let workletNode = null;
 let playbackQueueTime = 0;
+let resumeText = '';
 
-// ─── State Management ───
 function setState(newState) {
   appState = newState;
 
   appContainer.classList.remove('state-idle', 'state-listening', 'state-processing', 'state-speaking');
   appContainer.classList.add(`state-${newState}`);
 
-  // Drive WebGL shader intensity
   const intensityMap = { idle: 0.0, listening: 0.6, processing: 0.35, speaking: 1.0 };
   if (typeof window.setShaderIntensity === 'function') {
     window.setShaderIntensity(intensityMap[newState] ?? 0.0);
   }
 
-  // Drive circular wave emission — active while speaking or listening
   if (typeof window.setWaveActive === 'function') {
     window.setWaveActive(newState === 'speaking' || newState === 'listening');
   }
 
-  // Show/hide status area and end button
   if (newState === 'idle') {
     statusArea.style.display = 'none';
     endInterviewBtn.style.display = 'none';
@@ -60,7 +52,6 @@ function setState(newState) {
     endInterviewBtn.style.display = 'block';
   }
 
-  // Update status text
   switch (newState) {
     case 'listening':
       statusText.textContent = 'Listening…';
@@ -77,7 +68,6 @@ function setState(newState) {
   }
 }
 
-// ─── WebSocket Connection ───
 function connectWebSocket(profile) {
   ws = new WebSocket('ws://localhost:8001/ws/interview');
   ws.binaryType = 'arraybuffer';
@@ -86,10 +76,8 @@ function connectWebSocket(profile) {
     connectionDot.classList.add('connected');
     connectionLabel.textContent = 'Connected';
 
-    // Server expects the setup JSON as the very first message
     ws.send(JSON.stringify(profile));
 
-    // Hide left panel, show transcript, start mic
     formPanel.style.display = 'none';
     transcriptPanel.style.display = 'block';
 
@@ -148,7 +136,6 @@ function handleAudioMessage(arrayBuffer) {
   playPCM(arrayBuffer);
 }
 
-// ─── Audio Playback ───
 function playPCM(arrayBuffer) {
   if (!audioCtx) return;
 
@@ -167,7 +154,6 @@ function playPCM(arrayBuffer) {
   playbackQueueTime = startAt + buffer.duration;
 }
 
-// ─── Microphone & Audio Worklet ───
 async function startMicrophone() {
   audioCtx = new AudioContext({ sampleRate: 16000 });
   micStream = await navigator.mediaDevices.getUserMedia({
@@ -181,12 +167,10 @@ async function startMicrophone() {
   analyserNode.smoothingTimeConstant = 0.7;
   source.connect(analyserNode);
 
-  // PCM worklet — sends raw audio to backend
   await audioCtx.audioWorklet.addModule('pcm-worklet.js');
   workletNode = new AudioWorkletNode(audioCtx, 'pcm-processor');
 
   workletNode.port.onmessage = (e) => {
-    // Only forward mic audio while listening — prevents TTS feedback loop
     if (ws && ws.readyState === WebSocket.OPEN && appState === 'listening') {
       ws.send(e.data);
     }
@@ -195,7 +179,6 @@ async function startMicrophone() {
   source.connect(workletNode);
 }
 
-// ─── Session Stop ───
 function stopSession() {
   setState('idle');
 
@@ -217,7 +200,6 @@ function resetForm() {
   beginBtn.textContent = 'Begin Interview';
 }
 
-// ─── Transcript Helpers ───
 function addTranscriptEntry(label, text, type) {
   if (transcriptEmpty) transcriptEmpty.style.display = 'none';
 
@@ -237,13 +219,11 @@ function escapeHtml(text) {
   return div.innerHTML;
 }
 
-// ─── Begin Button ───
 beginBtn.addEventListener('click', () => {
   const name = document.getElementById('candidateName').value.trim();
   const role = document.getElementById('targetRole').value.trim();
 
   if (!name || !role) {
-    // Shake the missing fields
     if (!name) document.getElementById('candidateName').classList.add('input-error');
     if (!role) document.getElementById('targetRole').classList.add('input-error');
     return;
@@ -256,6 +236,7 @@ beginBtn.addEventListener('click', () => {
     company: document.getElementById('company').value.trim(),
     tech_stack: document.getElementById('techStack').value
       .split(',').map(s => s.trim()).filter(Boolean),
+    resume_text: resumeText,
   };
 
   beginBtn.disabled = true;
@@ -264,14 +245,66 @@ beginBtn.addEventListener('click', () => {
   connectWebSocket(profile);
 });
 
-// Clear error state on input
 ['candidateName', 'targetRole'].forEach(id => {
   document.getElementById(id).addEventListener('input', () => {
     document.getElementById(id).classList.remove('input-error');
   });
 });
 
-// ─── Orb Click — stop only ───
+function setResumeState(state, message = '') {
+  resumeDropZone.dataset.uploadState = state;
+
+  switch (state) {
+    case 'loading':
+      resumeDropText.textContent = 'Uploading…';
+      resumeStatus.textContent = '';
+      resumeStatus.className = 'resume-status';
+      break;
+    case 'success':
+      resumeDropText.textContent = message || 'Resume uploaded';
+      resumeStatus.textContent = '✓ Ready';
+      resumeStatus.className = 'resume-status resume-status--success';
+      break;
+    case 'error':
+      resumeDropText.textContent = 'Click to retry';
+      resumeStatus.textContent = message || 'Upload failed';
+      resumeStatus.className = 'resume-status resume-status--error';
+      break;
+    default:
+      resumeDropText.textContent = 'Click to upload PDF';
+      resumeStatus.textContent = '';
+      resumeStatus.className = 'resume-status';
+  }
+}
+
+resumeFileInput.addEventListener('change', async () => {
+  const file = resumeFileInput.files[0];
+  if (!file) return;
+
+  resumeText = '';
+  setResumeState('loading');
+
+  const formData = new FormData();
+  formData.append('file', file);
+
+  try {
+    const res = await fetch('/upload-resume', { method: 'POST', body: formData });
+    const body = await res.json();
+
+    if (!res.ok) {
+      setResumeState('error', body.detail || `Server error ${res.status}`);
+      return;
+    }
+
+    resumeText = body.resume_text || '';
+    const shortName = file.name.length > 24 ? file.name.slice(0, 21) + '…' : file.name;
+    setResumeState('success', shortName);
+  } catch (err) {
+    console.error('Resume upload failed:', err);
+    setResumeState('error', 'Network error — try again');
+  }
+});
+
 orbWrapper.addEventListener('click', () => {
   if (appState !== 'idle') stopSession();
 });
@@ -283,33 +316,26 @@ orbWrapper.addEventListener('keydown', (e) => {
   }
 });
 
-// ─── End Interview ───
 endInterviewBtn.addEventListener('click', () => {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
-  // Show modal in loading state immediately
   summaryModal.style.display = 'flex';
   summaryLoading.style.display = 'flex';
   summaryContent.style.display = 'none';
   summaryError.style.display = 'none';
 
-  // Stop mic so no more audio is sent
   if (micStream) micStream.getTracks().forEach(t => t.stop());
 
-  // Send control message — server will generate summary and close connection
   ws.send(JSON.stringify({ type: 'end_interview' }));
 
-  // Hide the end button to prevent double-clicks
   endInterviewBtn.style.display = 'none';
 
-  // Safety timeout — if summary doesn't arrive in 35s, show error
   const summaryTimeout = setTimeout(() => {
     if (summaryLoading.style.display !== 'none') {
       showSummaryError();
     }
   }, 35000);
 
-  // Clear the timeout once modal switches away from loading
   const clearOnLoad = new MutationObserver(() => {
     if (summaryLoading.style.display === 'none') {
       clearTimeout(summaryTimeout);
@@ -319,12 +345,9 @@ endInterviewBtn.addEventListener('click', () => {
   clearOnLoad.observe(summaryLoading, { attributes: true, attributeFilter: ['style'] });
 });
 
-// ─── Summary Modal ───
 function populateSummary(data) {
-  // Overall impression
   document.getElementById('summaryOverall').textContent = data.overall_impression || '—';
 
-  // Strengths
   const strengthsList = document.getElementById('summaryStrengths');
   strengthsList.innerHTML = '';
   (data.strengths || []).forEach(s => {
@@ -333,7 +356,6 @@ function populateSummary(data) {
     strengthsList.appendChild(li);
   });
 
-  // Areas to improve
   const areasList = document.getElementById('summaryAreas');
   areasList.innerHTML = '';
   (data.areas_to_improve || []).forEach(a => {
@@ -342,10 +364,8 @@ function populateSummary(data) {
     areasList.appendChild(li);
   });
 
-  // Communication notes
   document.getElementById('summaryComms').textContent = data.communication_notes || '—';
 
-  // Next steps
   const stepsList = document.getElementById('summaryNextSteps');
   stepsList.innerHTML = '';
   (data.suggested_next_steps || []).forEach(s => {
@@ -354,11 +374,9 @@ function populateSummary(data) {
     stepsList.appendChild(li);
   });
 
-  // Switch to content view
   summaryLoading.style.display = 'none';
   summaryContent.style.display = 'block';
 
-  // Clean up session now that summary is shown
   stopSession();
 }
 
@@ -372,10 +390,8 @@ document.getElementById('closeSummaryBtn').addEventListener('click', () => {
   summaryModal.style.display = 'none';
 });
 
-// Close on backdrop click
 summaryModal.addEventListener('click', (e) => {
   if (e.target === summaryModal) summaryModal.style.display = 'none';
 });
 
-// ─── Initialize ───
 setState('idle');
