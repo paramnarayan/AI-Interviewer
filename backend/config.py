@@ -6,6 +6,8 @@ load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL")
 
+GROQ_SUMMARY_MODEL = os.getenv("GROQ_SUMMARY_MODEL", "openai/gpt-oss-20b")
+
 WHISPER_MODEL_SIZE = "small.en"
 WHISPER_DEVICE = "cpu"
 WHISPER_COMPUTE_TYPE = "int8"
@@ -17,4 +19,4 @@ SAMPLE_RATE_IN = 16000
 SAMPLE_RATE_OUT = 24000
 
 VAD_SILENCE_MS = 1000
-VAD_AGGRESSIVENESS = 1
+VAD_THRESHOLD = 0.5          # Silero speech probability threshold (0–1)

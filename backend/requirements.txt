@@ -7,3 +7,8 @@ groq
 kokoro
 soundfile
 numpy
+pdfplumber
+python-multipart
+sqlalchemy[asyncio]
+aiosqlite
+redis[asyncio]
