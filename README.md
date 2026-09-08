@@ -26,7 +26,7 @@ AI Voice Interviewer enables low-latency, bidirectional conversational mock inte
 
 Once the session begins, users speak naturally through their browser; incoming audio is captured at 16 kHz, converted into raw Linear PCM bytes via an AudioWorklet, and streamed over a full-duplex WebSocket connection.
 
-The backend uses a Voice Activity Detector (webrtcvad) with an internal frame buffer to detect turn completion. Transcriptions from faster-whisper are processed by a Groq-hosted Qwen language model with hidden reasoning format. The response tokens are incrementally synthesized into 24 kHz audio chunks using Kokoro TTS on sentence boundaries, providing rapid Time-to-First-Audio (TTFA) and smooth conversational turn-taking.
+The backend uses a Voice Activity Detector (siler0-vad) with an internal frame buffer to detect turn completion. Transcriptions from faster-whisper are processed by a Groq-hosted Qwen language model with hidden reasoning format. The response tokens are incrementally synthesized into 24 kHz audio chunks using Kokoro TTS on sentence boundaries, providing rapid Time-to-First-Audio (TTFA) and smooth conversational turn-taking.
 
 All sessions are persisted to a **SQLite database** (via SQLAlchemy async) and conversation state is backed by **Redis** for reconnect resilience. Past interview transcripts and summaries are retrievable via a REST history endpoint.
 
