@@ -12,3 +12,4 @@ python-multipart
 sqlalchemy[asyncio]
 aiosqlite
 redis[asyncio]
+prometheus-client

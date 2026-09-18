@@ -42,3 +42,7 @@ Thumbs.db
 
 personal.md
 .personal.md
+
+# Observability — generated at runtime, not version-controlled
+logs/
+observability/grafana/data/

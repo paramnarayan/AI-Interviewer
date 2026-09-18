@@ -1,0 +1,87 @@
+groups:
+  - name: voice-interviewer-alerts
+    interval: 30s
+    rules:
+      # -----------------------------------------------------------------------
+      # STT latency
+      # -----------------------------------------------------------------------
+      - alert: HighSTTLatency
+        expr: >
+          histogram_quantile(0.95,
+            sum(rate(stt_latency_seconds_bucket[5m])) by (le)
+          ) > 2
+        for: 5m
+        labels:
+          severity: warning
+          stage: stt
+        annotations:
+          summary: "STT p95 latency above 2 seconds"
+          description: >
+            faster-whisper p95 transcription time has exceeded 2 s for 5 minutes.
+            Check CPU load on the backend host — this usually means the model is
+            being starved of compute (possibly by concurrent TTS synthesis).
+
+      # -----------------------------------------------------------------------
+      # LLM / Groq errors
+      # -----------------------------------------------------------------------
+      - alert: GroqErrorSpike
+        expr: rate(llm_errors_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: critical
+          stage: llm
+        annotations:
+          summary: "Elevated Groq LLM error rate — check rate limits"
+          description: >
+            More than 0.1 LLM errors/second over the last 5 minutes.
+            Likely cause: Groq rate-limit (429) or network timeout.
+            Check GROQ_API_KEY validity and current quota.
+
+      # -----------------------------------------------------------------------
+      # TTS errors
+      # -----------------------------------------------------------------------
+      - alert: TTSErrorSpike
+        expr: rate(tts_errors_total[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+          stage: tts
+        annotations:
+          summary: "Kokoro TTS error rate elevated"
+          description: >
+            TTS synthesis is failing at > 0.05 errors/second.
+            Check for empty input strings or Kokoro model issues.
+
+      # -----------------------------------------------------------------------
+      # End-to-end turn latency
+      # -----------------------------------------------------------------------
+      - alert: HighEndToEndLatency
+        expr: >
+          histogram_quantile(0.95,
+            sum(rate(conversation_turn_seconds_bucket[5m])) by (le)
+          ) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Full conversation turn p95 > 5 seconds"
+          description: >
+            Users are experiencing > 5 s round-trip latency. Break down
+            individual stage histograms (stt/llm_ttft/tts) in Grafana to
+            identify which stage is the bottleneck.
+
+      # -----------------------------------------------------------------------
+      # Resource leak guard
+      # -----------------------------------------------------------------------
+      - alert: NoSessionsButSTTActive
+        expr: >
+          active_websocket_sessions == 0
+          and rate(stt_latency_seconds_count[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "STT work occurring with no tracked active sessions"
+          description: >
+            The ACTIVE_SESSIONS gauge is 0 but STT is still being invoked.
+            Possible session tracking bug or a zombie transcription task.

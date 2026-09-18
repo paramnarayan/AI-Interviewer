@@ -8,10 +8,10 @@ import redis.asyncio as redis
 
 log = logging.getLogger("interview")
 
-# Redis URL — overridable via env var
+
 REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379")
-# Session TTL: default 24 hours
-_TTL_S: int = int(os.getenv("REDIS_SESSION_TTL_S", str(24 * 60 * 60)))
+
+_TTL_S: int = int(os.getenv("REDIS_SESSION_TTL_S", str(1 * 60 * 60)))
 
 redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 
@@ -23,12 +23,12 @@ class InterviewSession:
         self.session_id = session_id
         self.profile: dict = {}
 
-    # ── Profile ──────────────────────────────────────────────────────────────
+    
 
     def set_profile(self, profile: dict) -> None:
         self.profile = profile
 
-    # ── Conversation turns ────────────────────────────────────────────────────
+    
 
     def add_user_turn(self, text: str) -> None:
         self.history.append({"role": "user", "content": text})
@@ -36,7 +36,7 @@ class InterviewSession:
     def add_assistant_turn(self, text: str) -> None:
         self.history.append({"role": "assistant", "content": text})
 
-    # ── Redis persistence ─────────────────────────────────────────────────────
+    
 
     async def save(self) -> None:
         """

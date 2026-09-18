@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import time
 import uuid
 from contextlib import asynccontextmanager
 
@@ -9,6 +10,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
+from prometheus_client import make_asgi_app
+
+# Structured JSON logging — must be configured before any log calls
+import logging_config
+logging_config.configure_logging()
 
 from vad import TurnDetector
 from stt import transcribe
@@ -24,8 +30,8 @@ from database import (
     get_user_interview_history,
 )
 from routers.resume import router as resume_router
+from metrics import ACTIVE_SESSIONS, TURN_END_TO_END, TURNS_COMPLETED
 
-logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("interview")
 
 
@@ -43,6 +49,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Prometheus metrics endpoint — must be mounted before the catch-all StaticFiles
+metrics_app = make_asgi_app()
+app.mount("/metrics", metrics_app)
+
 app.include_router(resume_router)
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
@@ -57,6 +67,7 @@ async def interview_history(candidate_name: str):
 @app.websocket("/ws/interview")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
+    ACTIVE_SESSIONS.inc()
     log.info("WebSocket connected")
 
     interview_id = str(uuid.uuid4())
@@ -123,13 +134,22 @@ async def websocket_endpoint(websocket: WebSocket):
                 session.audio_buffer.extend(data)
 
                 if detector.process(data):
-                    log.info("End-of-turn detected, transcribing %d bytes…", len(session.audio_buffer))
+                    log.info(
+                        "End-of-turn detected, transcribing %d bytes",
+                        len(session.audio_buffer),
+                        extra={"session_id": interview_id, "stage": "vad"},
+                    )
 
+                    turn_start = time.perf_counter()
                     audio_bytes = bytes(session.audio_buffer)
                     session.audio_buffer.clear()
 
                     user_text = await asyncio.to_thread(transcribe, audio_bytes, context_terms)
-                    log.info("Transcription: %r", user_text)
+                    log.info(
+                        "Transcription complete: %r",
+                        user_text,
+                        extra={"session_id": interview_id, "stage": "stt"},
+                    )
 
                     if not user_text.strip():
                         detector.reset()
@@ -146,22 +166,41 @@ async def websocket_endpoint(websocket: WebSocket):
 
                     full_reply = ""
                     sentence_buffer = ""
+                    first_audio_sent = False
 
                     async for token in stream_reply(session.history, session.profile):
                         full_reply += token
                         sentence_buffer += token
                         if any(p in token for p in ".?!"):
                             pcm = await asyncio.to_thread(synthesize, sentence_buffer)
+                            if not first_audio_sent:
+                                # Record full turn latency on the very first audio chunk
+                                TURN_END_TO_END.observe(time.perf_counter() - turn_start)
+                                first_audio_sent = True
                             await websocket.send_bytes(pcm)
+                            log.debug(
+                                "Audio chunk sent",
+                                extra={"session_id": interview_id, "stage": "tts"},
+                            )
                             sentence_buffer = ""
 
                     if sentence_buffer.strip():
                         pcm = await asyncio.to_thread(synthesize, sentence_buffer)
+                        if not first_audio_sent:
+                            TURN_END_TO_END.observe(time.perf_counter() - turn_start)
+                            first_audio_sent = True
                         await websocket.send_bytes(pcm)
+
+                    if first_audio_sent:
+                        TURNS_COMPLETED.inc()
 
                     session.add_assistant_turn(full_reply)
                     await websocket.send_json({"type": "reply_complete", "text": full_reply})
-                    log.info("Reply sent: %s", full_reply[:80])
+                    log.info(
+                        "Reply complete: %s",
+                        full_reply[:80],
+                        extra={"session_id": interview_id, "stage": "llm"},
+                    )
 
                     await session.save()
                     try:
@@ -176,6 +215,8 @@ async def websocket_endpoint(websocket: WebSocket):
         log.info("WebSocket disconnected")
     except Exception as e:
         log.exception("Error in websocket handler: %s", e)
+    finally:
+        ACTIVE_SESSIONS.dec()
 
 
 app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")

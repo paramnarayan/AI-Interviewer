@@ -1,8 +1,11 @@
 import json
 import logging
 import re
+import time
+
 from groq import AsyncGroq
 from config import GROQ_API_KEY, GROQ_MODEL, GROQ_SUMMARY_MODEL
+from metrics import LLM_TTFT, LLM_TOTAL_LATENCY, LLM_ERRORS
 
 log = logging.getLogger("interview")
 
@@ -41,16 +44,37 @@ def SystemPrompt(profile: dict) -> str:
 
 
 async def stream_reply(history: list[dict], profile: dict):
-    stream = await client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[{"role": "system", "content": SystemPrompt(profile)}] + history,
-        stream=True,
-        reasoning_format="hidden",
-    )
-    async for chunk in stream:
-        token = chunk.choices[0].delta.content or ""
-        if token:
-            yield token
+    """
+    Stream tokens from Groq.
+
+    Records:
+      - LLM_TTFT: time from request start to first non-empty token (perceived latency).
+      - LLM_TOTAL_LATENCY: full wall-clock time from request to stream exhausted.
+      - LLM_ERRORS: labelled by exception class name on failure.
+    """
+    start = time.perf_counter()
+    first_token_time: float | None = None
+
+    try:
+        stream = await client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{"role": "system", "content": SystemPrompt(profile)}] + history,
+            stream=True,
+            reasoning_format="hidden",
+        )
+        async for chunk in stream:
+            token = chunk.choices[0].delta.content or ""
+            if token:
+                if first_token_time is None:
+                    first_token_time = time.perf_counter()
+                    LLM_TTFT.observe(first_token_time - start)
+                yield token
+
+    except Exception as e:
+        LLM_ERRORS.labels(error_type=type(e).__name__).inc()
+        raise
+    finally:
+        LLM_TOTAL_LATENCY.observe(time.perf_counter() - start)
 
 
 async def generate_summary(session) -> dict:
@@ -76,12 +100,17 @@ Use exactly this structure:
 Transcript:
 {transcript_text}"""
 
-    response = await client.chat.completions.create(
-        model=SUMMARY_MODEL,
-        messages=[{"role": "user", "content": summary_prompt}],
-        response_format={"type": "json_object"},
-        max_tokens=1024,
-    )
+    try:
+        response = await client.chat.completions.create(
+            model=SUMMARY_MODEL,
+            messages=[{"role": "user", "content": summary_prompt}],
+            response_format={"type": "json_object"},
+            max_tokens=1024,
+        )
+    except Exception as e:
+        LLM_ERRORS.labels(error_type=type(e).__name__).inc()
+        raise
+
     raw = (response.choices[0].message.content or "").strip()
     log.debug("Summary raw response: %r", raw)
     if not raw:

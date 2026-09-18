@@ -1,6 +1,9 @@
 from faster_whisper import WhisperModel
 import numpy as np
+import time
+
 from config import WHISPER_MODEL_SIZE, WHISPER_DEVICE, WHISPER_COMPUTE_TYPE, SAMPLE_RATE_IN
+from metrics import STT_LATENCY, STT_ERRORS, VAD_SEGMENTS
 
 whispermodel = WhisperModel(WHISPER_MODEL_SIZE, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE)
 
@@ -15,22 +18,39 @@ HALLUCINATIONS = {
 
 
 def transcribe(pcm_bytes: bytes, context_terms: list[str] = None) -> str:
-    audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+    """
+    Transcribe raw PCM audio bytes to text using faster-whisper.
 
-    if len(audio) / SAMPLE_RATE_IN < MIN_DURATION_SEC:
-        return ""
+    Records:
+      - VAD_SEGMENTS: incremented for every call (each call = one VAD-detected turn).
+      - STT_LATENCY: total wall-clock time spent in whisper, including I/O conversion.
+      - STT_ERRORS: labelled by exception class name on failure.
+    """
+    VAD_SEGMENTS.inc()
+    start = time.perf_counter()
+    try:
+        audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
 
-    if np.sqrt(np.mean(audio ** 2)) < MIN_RMS_THRESHOLD:
-        return ""
+        if len(audio) / SAMPLE_RATE_IN < MIN_DURATION_SEC:
+            return ""
 
-    initial_prompt = None
-    if context_terms:
-        initial_prompt = "relevant names and terms: " + ",".join(context_terms)
+        if np.sqrt(np.mean(audio ** 2)) < MIN_RMS_THRESHOLD:
+            return ""
 
-    segments, _ = whispermodel.transcribe(audio, language="en", beam_size=5, initial_prompt=initial_prompt)
-    text = " ".join(seg.text for seg in segments).strip()
+        initial_prompt = None
+        if context_terms:
+            initial_prompt = "relevant names and terms: " + ",".join(context_terms)
 
-    if text.lower().strip() in HALLUCINATIONS:
-        return ""
+        segments, _ = whispermodel.transcribe(audio, language="en", beam_size=5, initial_prompt=initial_prompt)
+        text = " ".join(seg.text for seg in segments).strip()
 
-    return text
+        if text.lower().strip() in HALLUCINATIONS:
+            return ""
+
+        return text
+
+    except Exception as e:
+        STT_ERRORS.labels(error_type=type(e).__name__).inc()
+        raise
+    finally:
+        STT_LATENCY.observe(time.perf_counter() - start)
